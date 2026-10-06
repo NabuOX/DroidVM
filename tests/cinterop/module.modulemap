@@ -1,0 +1,7 @@
+module CDroidVMBridge {
+    // Exposes the real engine bridge header to Swift for the interop harness. The path is
+    // relative to this file. Nothing is copied: the harness compiles against the same header
+    // the iOS target will.
+    header "../../engine/include/DroidVMBridge.h"
+    export *
+}

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""DroidVM repository guards.
+
+Runs anywhere with Python 3 -- including plain Windows, with no WSL and no Swift,
+which matters because DroidVM is developed on Windows. Invoked by
+scripts/check_host.sh and by CI.
+
+These are cheap checks for expensive mistakes:
+
+  * a required document went missing, or an empty placeholder got committed
+  * another project's branding leaked into DroidVM's identity
+  * a guest image, APK or other large binary got committed by accident
+  * THIRD_PARTY.md lost the columns that make it useful
+
+Exit status 0 when everything passes, 1 otherwise.
+"""
+
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+failures = []
+notes = []
+
+
+def fail(message):
+    failures.append(message)
+
+
+def ok(message):
+    notes.append(message)
+
+
+# --------------------------------------------------------------------- files
+
+REQUIRED_FILES = [
+    "README.md",
+    "ARCHITECTURE.md",
+    "THIRD_PARTY.md",
+    "LICENSE",
+    "docs/roadmap.md",
+    "docs/component-inventory.md",
+    "docs/licensing.md",
+    "docs/guest-assets.md",
+    "docs/guest-distribution.md",
+    "app/project.yml",
+    "core/Package.swift",
+]
+
+
+def check_required_files():
+    for rel in REQUIRED_FILES:
+        path = os.path.join(ROOT, rel)
+        if not os.path.isfile(path):
+            fail("missing required file: %s" % rel)
+            continue
+        if os.path.getsize(path) == 0:
+            fail("required file is empty: %s" % rel)
+    ok("required files: %d checked" % len(REQUIRED_FILES))
+
+
+# ---------------------------------------------------------------- provenance
+
+# Files permitted to name another project, because provenance must be recorded rather
+# than concealed. Everything else in the tree must be DroidVM's own.
+PROVENANCE_WHITELIST = {
+    "THIRD_PARTY.md",
+    "docs/licensing.md",
+    "docs/component-inventory.md",
+    # guest-assets.md records distribution obligations, including the file whose provenance
+    # caused a licensing finding. Warning against copying it requires naming it.
+    "docs/guest-assets.md",
+    "core/Sources/DroidVMCore/Identity.swift",
+    "scripts/check_repo.py",          # this file names the marker to look for
+    "core/Tests/DroidVMCoreTests/IdentityTests.swift",
+}
+
+# Words that must not appear outside the whitelist. Kept deliberately short: this is a
+# branding guard, not a general-purpose word filter.
+FOREIGN_MARKERS = ["husk"]
+
+# Text files only. Binary formats would produce noise, and git already ignores them.
+TEXT_SUFFIXES = {
+    ".swift", ".c", ".h", ".m", ".mm", ".md", ".txt", ".sh", ".py", ".yml", ".yaml",
+    ".json", ".plist", ".entitlements", ".pbxproj", ".xcconfig", ".modulemap",
+}
+
+SKIP_DIRS = {".git", "build", ".build", "DerivedData", "node_modules", "__pycache__"}
+
+
+def iter_text_files():
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in TEXT_SUFFIXES:
+                yield os.path.relpath(os.path.join(dirpath, name), ROOT).replace(os.sep, "/")
+
+
+def check_no_foreign_branding():
+    """Fail if another project's name appears outside the documented places.
+
+    DroidVM is an independent product. Reused code is accounted for in THIRD_PARTY.md
+    and described in the inventory; it must not appear as a product name, a bundle
+    identifier or a UI string anywhere else.
+    """
+    offenders = []
+    for rel in iter_text_files():
+        if rel in PROVENANCE_WHITELIST:
+            continue
+        try:
+            with open(os.path.join(ROOT, rel), "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read().lower()
+        except OSError as exc:
+            fail("could not read %s: %s" % (rel, exc))
+            continue
+        for marker in FOREIGN_MARKERS:
+            if marker in text:
+                # Report the first offending line so the fix is obvious.
+                with open(os.path.join(ROOT, rel), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        if marker in line.lower():
+                            offenders.append("%s:%d: %s" % (rel, lineno, line.strip()[:100]))
+                            break
+                break
+
+    if offenders:
+        fail(
+            "foreign branding found outside the provenance whitelist "
+            "(%d file(s)). Reused code must be recorded in THIRD_PARTY.md and "
+            "described in docs/component-inventory.md; it must not appear as a product "
+            "name, bundle id or user-facing string." % len(offenders)
+        )
+        for entry in offenders[:15]:
+            failures.append("    " + entry)
+    else:
+        ok("branding: clean outside %d whitelisted provenance file(s)"
+           % len(PROVENANCE_WHITELIST))
+
+
+# ------------------------------------------------------------------- assets
+
+# Guest images, firmware and APKs are downloaded at runtime, never committed: they are
+# hundreds of megabytes, they are other projects' distributions, and the kernel inside
+# a guest image carries its own source-offer obligation.
+FORBIDDEN_SUFFIXES = {
+    ".qcow2", ".img", ".apk", ".ipa", ".dylib", ".a", ".o", ".fd",
+    ".vmdk", ".raw", ".iso", ".gz", ".xz", ".zst", ".zip",
+}
+
+MAX_BYTES = 2 * 1024 * 1024   # 2 MiB: DroidVM's own sources and docs are far smaller.
+
+
+def check_no_committed_assets():
+    offenders = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
+            ext = os.path.splitext(name)[1].lower()
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if ext in FORBIDDEN_SUFFIXES:
+                offenders.append("%s (%s) -- forbidden artifact type" % (rel, ext))
+            elif size > MAX_BYTES:
+                offenders.append("%s (%.1f MiB) -- over the %d MiB limit"
+                                 % (rel, size / 1048576.0, MAX_BYTES // 1048576))
+
+    if offenders:
+        fail("large or redistributable artifacts in the tree:")
+        for entry in offenders[:15]:
+            failures.append("    " + entry)
+    else:
+        ok("assets: no guest images, APKs or large binaries committed")
+
+
+# ------------------------------------------------------------------ third party
+
+THIRD_PARTY_COLUMNS = ["Source", "License", "Reuse", "Destination"]
+
+# The obligations that decide how DroidVM may be distributed at all. If one of these
+# disappears from the record, the record has stopped being useful.
+THIRD_PARTY_MUST_MENTION = [
+    "QEMU",
+    "GPL",
+    "ANGLE",
+    "MoltenVK",
+    "StikJIT",
+    "StikDebug",
+    "idevice",
+]
+
+
+def check_third_party_record():
+    path = os.path.join(ROOT, "THIRD_PARTY.md")
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    for column in THIRD_PARTY_COLUMNS:
+        if column not in text:
+            fail("THIRD_PARTY.md lost its '%s' column" % column)
+
+    lowered = text.lower()
+    for term in THIRD_PARTY_MUST_MENTION:
+        if term.lower() not in lowered:
+            fail("THIRD_PARTY.md does not mention %s" % term)
+
+    ok("third-party record: %d columns, %d required entries present"
+       % (len(THIRD_PARTY_COLUMNS), len(THIRD_PARTY_MUST_MENTION)))
+
+
+# ----------------------------------------------------------------- identity
+
+def check_identity_values():
+    """The bundle identifiers in the core package must be DroidVM's own."""
+    path = os.path.join(ROOT, "core/Sources/DroidVMCore/Identity.swift")
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    match = re.search(r'bundleIdentifier\s*=\s*"([^"]+)"', text)
+    if not match:
+        fail("could not read bundleIdentifier from Identity.swift")
+        return
+    ident = match.group(1)
+    if not ident.startswith("com.droidvm."):
+        fail("bundle identifier %r is not in DroidVM's namespace" % ident)
+    else:
+        ok("identity: bundle identifier %s" % ident)
+
+
+# ------------------------------------------------------------------- main
+
+def main():
+    print("DroidVM repository guards")
+    print("  root: %s" % ROOT)
+    print("")
+
+    check_required_files()
+    check_no_foreign_branding()
+    check_no_committed_assets()
+    check_third_party_record()
+    check_identity_values()
+
+    for note in notes:
+        print("  ok   %s" % note)
+    for problem in failures:
+        print(("  FAIL %s" % problem) if not problem.startswith("    ") else problem)
+
+    print("")
+    if failures:
+        print("guards: FAIL (%d problem(s))" % len(failures))
+        return 1
+    print("guards: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

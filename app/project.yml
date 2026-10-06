@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# DroidVM's Xcode project, as a declarative source of truth.
+#
+# The .pbxproj is a build artefact of this file, not something to edit by hand: a pbxproj
+# edited directly drifts, and a new source file that is silently absent from the target shows
+# up only as "cannot find X in scope" for a type that is plainly on disk. `xcodegen generate`
+# regenerates it, and scripts/package_ipa.sh does so before building.
+#
+# IDENTITY IS DROIDVM'S THROUGHOUT: target, scheme, product, bundle identifier, display name
+# and artifact. No other project's name appears anywhere in this file, and
+# scripts/check_repo.py enforces that across the tree.
+#
+# STATUS: created in Phase 1.1, never built. app/DroidVMApp does not exist yet -- Phase 2
+# creates the app target. This file exists so that the identity, the bridging header and the
+# embedded-library wiring are decided before the code that depends on them.
+
+name: DroidVM
+
+options:
+  bundleIdPrefix: com.droidvm
+  deploymentTarget:
+    iOS: "16.4"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.4"
+    ENABLE_BITCODE: NO
+    # The engine is C and C++ as well as Swift.
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_ENABLE_OBJC_ARC: YES
+    # Warnings are not decoration here: the engine adapters carry @unchecked Sendable and
+    # pointer bridging, and a suppressed warning in either is how those go wrong quietly.
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+
+packages:
+  DroidVMCore:
+    # The platform-independent core. A separate module, which is why the engine adapters must
+    # import it -- a boundary the bridge interop harness verifies on the host.
+    path: ../core
+
+targets:
+
+  # ------------------------------------------------------------------ the app
+  #
+  # Phase 2 populates app/DroidVMApp. Until then this target has no sources and will not
+  # build, which is correct: an empty target that "builds" would be a green gate over nothing.
+  DroidVM:
+    type: application
+    platform: iOS
+    sources:
+      - path: DroidVMApp
+      # The engine adapters compile into the app target, so that the bridging header below
+      # applies to them. They reach QEMU only through the bridge.
+      - path: ../engine
+        name: Engine
+        excludes:
+          - "vendor/**"
+          - "include/**"
+    dependencies:
+      - package: DroidVMCore
+        product: DroidVMCore
+    settings:
+      base:
+        PRODUCT_NAME: DroidVM
+        PRODUCT_BUNDLE_IDENTIFIER: com.droidvm.app
+        INFOPLIST_FILE: DroidVMApp/Info.plist
+        # NOT generated: the keys are supplied explicitly, which is why package_ipa.sh
+        # validates them. Xcode does not inject CFBundleIdentifier when a custom
+        # INFOPLIST_FILE is used without GENERATE_INFOPLIST_FILE.
+        GENERATE_INFOPLIST_FILE: NO
+        # The single door to the engine's C API.
+        SWIFT_OBJC_BRIDGING_HEADER: ../engine/include/DroidVMBridge.h
+        # Search paths for the engine's C sources, if any are compiled in directly.
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/../engine/include"
+        # Unsigned by default: SideStore / AltStore / TrollStore re-sign at install.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        # The guest image is gigabytes and lives outside the bundle.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        DEFINES_MODULE: YES
+        # Increased memory limit plus get-task-allow, both required by the runtime. The
+        # entitlements FILE is DroidVM's own; Phase 2 authors it.
+        CODE_SIGN_ENTITLEMENTS: DroidVMApp/DroidVM.entitlements
+
+# ---------------------------------------------------------------------- notes
+#
+# NOT YET WIRED, and deliberately so:
+#
+#   * libqemu-aarch64-softmmu.dylib and libANGLE-shared.dylib must be embedded in
+#     DroidVM.app/Frameworks. That is a build phase produced by scripts/build_engine_ios.sh,
+#     and scripts/package_ipa.sh refuses to package a bundle missing either of them.
+#   * The guest assets -- firmware, the system disk, the manifest -- are downloaded, not
+#     committed. See docs/guest-assets.md.
+#   * The JIT helper app extension exists only if DroidVM ships a built-in activation route.
+#     Its identifier would nest under com.droidvm.app, and its script must be the MPL-2.0 one
+#     from StikJIT -- never the AGPL-derived file the reference implementation bundles.
+#     See THIRD_PARTY.md.

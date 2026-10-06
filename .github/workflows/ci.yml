@@ -1,0 +1,152 @@
+# DroidVM CI.
+#
+# DroidVM is developed on Windows with no local Mac, so CI is not a convenience: it is the
+# only place Levels B-E can run. Gate 1 runs on every push so the common mistakes are caught
+# in seconds rather than after a macOS round trip.
+#
+# THE STAGES ARE INDEPENDENT AND ARE NEVER INFERRED FROM ONE ANOTHER:
+#
+#   gate 1  HOST TEST    core tests, guards, engine syntax, bridge interop    ubuntu
+#   gate 2  IOS COMPILE  core module + engine + app against the iOS SDK       macos
+#   gate 3  ENGINE LINK  cross-compile QEMU, verify the export list           macos (manual)
+#   gate 4  IPA PACKAGE  bundle validation, unsigned IPA                      macos (manual)
+#   gate 5  DEVICE       a human with a phone                                 not automatable
+#
+# A green compile is not a link. A link is not a signature. None of them is a device test.
+# Each job prints the toolchain that produced its result, so a pass is attributable and a
+# failure is not guessed at.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------- gate 1
+  host:
+    name: gate 1 - host test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          set -x
+          uname -srm
+          swift --version
+          cc --version | head -1
+
+      - name: host check (core tests + guards + engine syntax + bridge interop)
+        run: ./scripts/check_host.sh
+
+  # ---------------------------------------------------------------- gate 2
+  ios-compile:
+    name: gate 2 - iOS compile
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reported unconditionally, so a green run records which toolchain produced it.
+      - name: environment
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          swift --version
+          swiftc --version
+
+      - name: type-check (core module, engine adapters, app target, arm64 assembly)
+        run: ./scripts/typecheck_ios.sh
+
+  # ---------------------------------------------------------------- gate 3
+  #
+  # Manual only. Building QEMU and its dependency set for arm64-apple-ios takes hours on a
+  # cold cache, so this is not run on every push.
+  engine-link:
+    name: gate 3 - engine link (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: environment
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+          brew --version 2>/dev/null | head -1 || true
+
+      # Installed rather than assumed: the engine stage needs meson, ninja and pkg-config, and
+      # a missing one otherwise fails deep inside a dependency's configure step.
+      - name: build tools
+        run: |
+          brew install meson ninja pkg-config || true
+          meson --version && ninja --version && pkg-config --version
+
+      - name: build the engine for iOS
+        run: ./scripts/build_engine_ios.sh
+
+      - name: export list report
+        run: |
+          echo "Every symbol DroidVM calls must be exported, because a missing one links"
+          echo "successfully and fails at dlopen. build_engine_ios.sh checks and reports."
+
+  # ---------------------------------------------------------------- gate 4
+  ipa:
+    name: gate 4 - IPA package (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: environment
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: build tools
+        run: brew install xcodegen meson ninja pkg-config || true
+
+      - name: build the engine for iOS
+        run: ./scripts/build_engine_ios.sh
+
+      - name: package the unsigned IPA
+        run: ./scripts/package_ipa.sh
+
+      - name: stage result
+        run: |
+          {
+            echo "COMPILE       PASS (gate 2 also ran)"
+            echo "LINK          PASS (build_engine_ios.sh exits non-zero otherwise)"
+            echo "SIGNING       NOT REQUIRED - unsigned IPA, re-signed by the installer"
+            echo "DEVICE TEST   NOT RUN - gate 5 is a human with a phone"
+          } | tee build/stage-result.txt
+
+      - name: upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidVM-unsigned-ipa
+          path: build/DroidVM.ipa
+          if-no-files-found: error
+
+      - name: upload stage result
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidVM-stage-result
+          path: build/stage-result.txt

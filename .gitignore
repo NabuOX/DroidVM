@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# DroidVM ignore rules.
+
+# ---- Swift / SwiftPM ----
+.build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+*.moved-aside
+
+# ---- build output ----
+build/
+out/
+*.app
+*.appex
+*.ipa
+*.dSYM/
+
+# ---- compiled artifacts ----
+*.o
+*.a
+*.dylib
+*.so
+*.swiftmodule
+*.swiftdoc
+
+# ---- guest images and redistributable blobs ----
+# Never committed: hundreds of megabytes, other projects' distributions, and a guest
+# kernel carries its own source-offer obligation. Downloaded at runtime instead.
+*.qcow2
+*.img
+*.raw
+*.vmdk
+*.iso
+*.fd
+*.apk
+*.zip
+*.gz
+*.xz
+*.zst
+
+# ---- local toolchain (see docs/build.md) ----
+swiftroot/
+toolchain/
+
+# ---- editor / OS ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.pyc
