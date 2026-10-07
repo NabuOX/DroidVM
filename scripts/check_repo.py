@@ -363,6 +363,58 @@ def check_project_format():
     ok("project format: %s, for Xcode 15.4" % fmt)
 
 
+def check_app_target_excludes_qemu_internals():
+    """QEMU-internal sources must not be compiled by the Xcode app target.
+
+    A source that needs QEMU's headers can only be built inside QEMU's own build, so it must not
+    be reachable from the app target. The first time this went wrong, Xcode compiled
+    engine/qemu-native/droidvm_qemu_runtime.c and APP LINK died with
+    "fatal error: 'qemu/osdep.h' file not found" -- after every other gate had passed, which
+    reads like a link problem rather than a mis-scoped source.
+
+    Two checks, and deliberately no more: the exclusion is present, and nothing outside the
+    excluded directory needs QEMU's headers unconditionally. Portable files carry such an include
+    only inside `#ifdef DROIDVM_WITH_QEMU`, which Xcode never preprocesses.
+    """
+    spec_path = os.path.join(ROOT, "app", "project.yml")
+    if not os.path.isfile(spec_path):
+        return
+    with open(spec_path, "r", encoding="utf-8") as fh:
+        spec = fh.read()
+
+    if '"qemu-native/**"' not in spec:
+        fail("app/project.yml does not exclude qemu-native/**, so the app target would compile "
+             "QEMU-internal sources")
+        return
+
+    offenders = []
+    engine = os.path.join(ROOT, "engine")
+    for dirpath, dirnames, filenames in os.walk(engine):
+        if os.path.relpath(dirpath, engine).startswith("qemu-native"):
+            continue
+        for name in filenames:
+            if not name.endswith((".c", ".h")):
+                continue
+            full = os.path.join(dirpath, name)
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                guarded = 0
+                for lineno, line in enumerate(fh, 1):
+                    s = line.strip()
+                    if s.startswith("#ifdef DROIDVM_WITH_QEMU") or \
+                       s.startswith("#if defined(DROIDVM_WITH_QEMU)"):
+                        guarded += 1
+                    elif s.startswith("#endif") and guarded:
+                        guarded -= 1
+                    elif "#include" in s and "qemu/" in s and not guarded:
+                        offenders.append("%s:%d" % (os.path.relpath(full, ROOT), lineno))
+
+    if offenders:
+        fail("these files need QEMU's headers outside engine/qemu-native/: %s"
+             % ", ".join(offenders))
+    else:
+        ok("app target: no QEMU-internal source reachable outside engine/qemu-native/")
+
+
 # ------------------------------------------------------------------- main
 
 # ------------------------------------------------------------------- modes
@@ -432,6 +484,7 @@ def main():
     check_script_modes()
     check_symbol_manifest()
     check_project_format()
+    check_app_target_excludes_qemu_internals()
 
     for note in notes:
         print("  ok   %s" % note)

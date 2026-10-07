@@ -83,6 +83,8 @@ targets:
           - "README.md"
           - "patches/**"
           - "symbols/**"
+          # QEMU-internal sources: only QEMU's build may compile these.
+          - "qemu-native/**"
     dependencies:
       - package: DroidVMCore
         product: DroidVMCore
