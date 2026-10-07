@@ -61,6 +61,7 @@ echo "==> building"
 set +e
 xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
     -sdk iphoneos -configuration Release -derivedDataPath "$DD" \
+    -destination 'generic/platform=iOS' \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
     build > "$DD/build.log" 2>&1
 BUILD_STATUS=$?
@@ -79,6 +80,26 @@ if [ "$BUILD_STATUS" -ne 0 ] || ! grep -q "BUILD SUCCEEDED" "$DD/build.log"; the
 fi
 echo "==> COMPILE PASS"
 echo "==> LINK PASS"
+
+# ---------------------------------------------------------------- embed the engine
+#
+# Packaging owns this because the dylib is a runtime dependency the app loads dynamically through
+# dlopen, not a link-time one. There is deliberately no Xcode build phase and no linkage between the
+# app target and QEMU -- the app target must never compile QEMU-internal sources.
+echo "==> embedding the engine"
+[ -f "$ENGINE_LIB" ] || {
+    echo "error: no engine library at $ENGINE_LIB" >&2
+    echo "       build it first: ./scripts/build_engine_ios.sh deps qemu" >&2
+    exit 1
+}
+mkdir -p "$APP/Frameworks"
+cp -f "$ENGINE_LIB" "$APP/Frameworks/libqemu-aarch64-softmmu.dylib"
+printf "  ok       %-28s %s\n" "embedded libqemu-aarch64-softmmu" \
+    "$(du -h "$APP/Frameworks/libqemu-aarch64-softmmu.dylib" | cut -f1)"
+
+# The engine library, from the verified engine build. One canonical path, and the runtime looks
+# in exactly one place that matches it: DroidVM.app/Frameworks.
+ENGINE_LIB="${DROIDVM_ENGINE_LIB:-$ROOT/build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib}"
 
 APP="$DD/Build/Products/Release-iphoneos/$APP_NAME.app"
 [ -d "$APP" ] || { echo "error: no app bundle at $APP" >&2; exit 1; }
@@ -132,16 +153,73 @@ elif [ -n "$EXE" ]; then
     printf "  ok       %-28s %s\n" "executable present" "$EXE"
 fi
 
-# Every embedded library, not one of them. A bundle missing either QEMU or ANGLE launches to a
-# dyld error; a check covering only one reports success on a bundle that cannot start.
-for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib; do
-    if [ ! -f "$APP/Frameworks/$lib" ]; then
-        echo "  MISSING  Frameworks/$lib" >&2
+# The engine is the one embedded library THIS ARCHITECTURE NEEDS. QEMU is built with
+# --disable-opengl --disable-virglrenderer and the display path is software (pixman through
+# DisplayChangeListenerOps), so there is no libANGLE-shared.dylib to embed. ANGLE stays in
+# THIRD_PARTY.md as planned acceleration work and becomes a requirement only when that backend
+# lands -- at which point this check must gain it back rather than silently shipping without it.
+QEMU_LIB="$APP/Frameworks/libqemu-aarch64-softmmu.dylib"
+if [ ! -f "$QEMU_LIB" ]; then
+    echo "  MISSING  Frameworks/libqemu-aarch64-softmmu.dylib" >&2
+    rc=1
+else
+    printf "  ok       %-28s %s\n" "engine embedded" "$(du -h "$QEMU_LIB" | cut -f1)"
+
+    # A zero-byte or wrong-arch library installs fine and fails at dlopen, on the device, with no
+    # useful message. Both are checked here.
+    if [ ! -s "$QEMU_LIB" ]; then
+        echo "  EMPTY    the engine library has no content" >&2
         rc=1
-    else
-        printf "  ok       %-28s %s\n" "$lib" "$(du -h "$APP/Frameworks/$lib" | cut -f1)"
     fi
-done
+    ARCHS="$(lipo -archs "$QEMU_LIB" 2>/dev/null || echo unknown)"
+    case "$ARCHS" in
+        *arm64*) printf "  ok       %-28s %s\n" "engine architecture" "$ARCHS" ;;
+        *) echo "  WRONG    engine architecture is '$ARCHS', expected arm64" >&2; rc=1 ;;
+    esac
+
+    # The symbols the app resolves by name. Read from the manifest so this cannot drift from what
+    # SYMBOL VERIFY checked inside QEMU.
+    MANIFEST="$ROOT/engine/symbols/required-engine-symbols.txt"
+    missing_syms=0
+    while IFS= read -r line; do
+        sym="$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')"
+        [ -n "$sym" ] || continue
+        if ! nm -gU "$QEMU_LIB" 2>/dev/null | grep -q "_$sym\$"; then
+            echo "  MISSING  export $sym" >&2
+            missing_syms=$((missing_syms + 1))
+        fi
+    done < "$MANIFEST"
+    if [ "$missing_syms" -eq 0 ]; then
+        printf "  ok       %-28s %s\n" "engine exports" "all present"
+    else
+        rc=1
+    fi
+
+    # Every non-system dependency must travel inside the bundle, or the app dies at launch on the
+    # device with a dyld error that names a library nobody shipped.
+    echo "  -- dependencies --"
+    otool -L "$QEMU_LIB" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+        case "$dep" in
+            /usr/lib/*|/System/Library/*) printf "  ok       %-28s %s\n" "system" "$dep" ;;
+            @rpath/*|@loader_path/*|@executable_path/*)
+                base="$(basename "$dep")"
+                if [ -f "$APP/Frameworks/$base" ]; then
+                    printf "  ok       %-28s %s\n" "in bundle" "$base"
+                else
+                    echo "  MISSING  dependency '$dep' is not in the bundle" >&2
+                    rc=1
+                fi ;;
+            *)
+                base="$(basename "$dep")"
+                if [ -f "$APP/Frameworks/$base" ]; then
+                    printf "  ok       %-28s %s\n" "in bundle" "$base"
+                else
+                    echo "  MISSING  dependency '$dep' is not a system library and is not in the bundle" >&2
+                    rc=1
+                fi ;;
+        esac
+    done
+fi
 
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
 

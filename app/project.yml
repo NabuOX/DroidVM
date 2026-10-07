@@ -117,9 +117,12 @@ targets:
 #
 # NOT YET WIRED, and deliberately so:
 #
-#   * libqemu-aarch64-softmmu.dylib and libANGLE-shared.dylib must be embedded in
-#     DroidVM.app/Frameworks. That is a build phase produced by scripts/build_engine_ios.sh,
-#     and scripts/package_ipa.sh refuses to package a bundle missing either of them.
+#   * libqemu-aarch64-softmmu.dylib must be embedded in DroidVM.app/Frameworks.
+#     scripts/package_ipa.sh copies it there after a verified build and refuses to package
+#     without it.
+#     libANGLE-shared.dylib is NOT embedded: QEMU is built with --disable-opengl and the display
+#     path is software through pixman and DisplayChangeListenerOps. ANGLE is planned acceleration
+#     work (THIRD_PARTY.md) and becomes part of the bundle only when that backend is introduced.
 #   * The guest assets -- firmware, the system disk, the manifest -- are downloaded, not
 #     committed. See docs/guest-assets.md.
 #   * The JIT helper app extension exists only if DroidVM ships a built-in activation route.

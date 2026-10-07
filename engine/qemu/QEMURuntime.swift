@@ -91,14 +91,30 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
                 technical: "prepare() called twice on the same runtime"))
         }
 
-        guard let path = Bundle.main.path(forResource: Self.libraryName,
-                                          ofType: "dylib") else {
+        // THE canonical production location, and the one scripts/package_ipa.sh writes to:
+        // DroidVM.app/Frameworks. `path(forResource:ofType:)` searches the bundle's RESOURCE
+        // directory, which is not where an embedded library lives, so Frameworks is resolved
+        // explicitly rather than inferred.
+        let libraryFile = "\(Self.libraryName).dylib"
+        var candidates: [URL] = []
+        if let frameworks = Bundle.main.privateFrameworksURL {
+            candidates.append(frameworks.appendingPathComponent(libraryFile))
+        }
+        // A narrow fallback: the host interop harness has no app bundle, so it stages the library
+        // among the resources instead. Production always takes the path above.
+        if let bundled = Bundle.main.path(forResource: Self.libraryName, ofType: "dylib") {
+            candidates.append(URL(fileURLWithPath: bundled))
+        }
+        guard let resolved = candidates.first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }) else {
             throw VMFailureError(VMFailure(
                 stage: .preparation,
                 reason: "Android could not be prepared.",
-                technical: "\(Self.libraryName).dylib is not in the app bundle; the "
-                         + "packaging step must embed it"))
+                technical: "\(libraryFile) is not in the app bundle; the packaging step must "
+                         + "embed it in Frameworks"))
         }
+        let path = resolved.path
 
         // RTLD_NOW, so a missing or renamed symbol fails here with a name in the message
         // rather than at first use inside a vCPU thread.
@@ -352,7 +368,7 @@ extension QEMURuntime {
 
         observation.state = DroidVMDisplayState(rawValue: snapshot.state) ?? .notAttempted
         observation.updates = snapshot.updates
-        observation.surfaceReplacements = snapshot.surfaceReplacements
+        observation.surfaceReplacements = snapshot.surface_replacements
         if snapshot.width > 0, snapshot.height > 0 {
             observation.width = Int(snapshot.width)
             observation.height = Int(snapshot.height)
