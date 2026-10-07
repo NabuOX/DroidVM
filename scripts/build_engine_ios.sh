@@ -472,6 +472,8 @@ qemu_integration_fingerprint() {
         "engine/qemu-native/droidvm_qemu_runtime.h"
         "engine/qemu-native/droidvm_qemu_display.c"
         "engine/qemu-native/meson.build"
+        # QEMU compiles this, so a change to it must invalidate the stamp.
+        "engine/include/DroidVMBridge.h"
         "engine/patches/droidvm-qemu-main-loop.patch"
         "engine/symbols/required-engine-symbols.txt"
     )

@@ -69,7 +69,7 @@ jobs:
             build/ios-arm64/sysroot
             build/ios-arm64/stamps
             engine/vendor
-          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/include/DroidVMBridge.h', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
           restore-keys: |
             engine-${{ runner.os }}-
 
@@ -94,7 +94,7 @@ jobs:
             build/ios-arm64/sysroot
             build/ios-arm64/stamps
             engine/vendor
-          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/include/DroidVMBridge.h', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
 
       # ---------------------------------------------------------------- layer 4
       - name: 4. SYMBOL VERIFY

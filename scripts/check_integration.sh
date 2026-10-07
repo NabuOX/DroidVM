@@ -300,6 +300,7 @@ else
                "engine/qemu-native/droidvm_qemu_display.c" \
                "engine/patches/droidvm-qemu-main-loop.patch" \
                "engine/qemu-native/meson.build" \
+               "engine/include/DroidVMBridge.h" \
                "scripts/integrate_engine.sh"; do
         saved="$WORK/fp.saved"
         cp "$FP/$rel" "$saved"
