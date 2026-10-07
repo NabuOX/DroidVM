@@ -1,7 +1,13 @@
 module CDroidVMBridge {
-    // Exposes the real engine bridge header to Swift for the interop harness. The path is
-    // relative to this file. Nothing is copied: the harness compiles against the same header
-    // the iOS target will.
+    // The narrow door the Swift adapters reach through. Public by design.
     header "../../engine/include/DroidVMBridge.h"
+    export *
+}
+
+module CDroidVMNative {
+    // The engine's internal seams. Internal by design -- the Swift application never
+    // includes this, but the host tests drive the six counters through it, which is what
+    // makes them testable off-device.
+    header "../../engine/native/droidvm_native.h"
     export *
 }

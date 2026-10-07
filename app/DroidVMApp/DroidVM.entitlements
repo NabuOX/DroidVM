@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    DroidVM's entitlements.
+
+    DROIDVM'S OWN FILE. The identity is DroidVM's; only the *set* of entitlements is informed
+    by what the runtime needs, which is recorded in docs/component-inventory.md.
+
+    Only two are here, and each is load-bearing:
+
+      get-task-allow
+          The runtime cannot obtain executable memory without a debugger attached, and a
+          debugger cannot attach without this. This is also one of the two independent
+          reasons DroidVM can never ship on the App Store -- App Review does not permit it,
+          which is a licensing-and-distribution fact, not a technical one that might be
+          engineered away.
+
+      increased-memory-limit
+          A guest running Android needs far more memory than a default app is allowed. Without
+          this the process is killed with SIGKILL -- no handler, no crash log -- which is why
+          MemoryPressureManager watches available-before-kill rather than total usage.
+
+    Neither is applied to the unsigned IPA: scripts/package_ipa.sh builds with
+    CODE_SIGNING_ALLOWED=NO, so entitlements are not embedded, and the installer re-signs with
+    its own. They are here so the signed path is correct when there is one.
+-->
+<plist version="1.0">
+<dict>
+    <key>get-task-allow</key>
+    <true/>
+
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>

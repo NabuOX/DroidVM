@@ -127,9 +127,23 @@ size_t droidvm_display_counters_sizeof(void);
 /* Read the counters. Monotonic; never resets while the machine lives. */
 void droidvm_display_read(droidvm_display_counters *out);
 
-/* Register the listener. Returns 0 on success, non-zero if a listener
- * is already registered (which would orphan a surface). */
+/* Register the listener. Returns 0 on success, non-zero on failure:
+ *
+ *   1  a listener is already registered, and a second would orphan
+ *      the first surface -- which shows up as a frame counter
+ *      climbing against a black screen
+ *   2  this build has no engine to register with
+ *
+ * The codes are distinguished rather than collapsed, because only one
+ * of them is a bug in the caller. `droidvm_display_last_reason()`
+ * carries the detail. */
 int droidvm_display_register(void);
+
+/* A human-readable reason for the last display-side refusal or
+ * transition. Static storage; valid until the next call. Not for
+ * display to a user -- the Swift adapter maps it onto DroidVM's own
+ * plain language. */
+const char *droidvm_display_last_reason(void);
 
 /* Whether a display surface is currently bound. */
 int droidvm_display_is_attached(void);

@@ -47,6 +47,16 @@ REQUIRED_FILES = [
     "docs/guest-assets.md",
     "docs/guest-distribution.md",
     "app/project.yml",
+    "app/DroidVMApp/DroidVMApp.swift",
+    "app/DroidVMApp/Info.plist",
+    "app/DroidVMApp/DroidVM.entitlements",
+    "engine/include/DroidVMBridge.h",
+    "engine/native/droidvm_native.h",
+    "engine/native/droidvm_jit.c",
+    "engine/native/droidvm_display.c",
+    "engine/native/droidvm_runtime.c",
+    "engine/jit/droidvm-brk.S",
+    "engine/symbols/required-symbols.txt",
     "core/Package.swift",
 ]
 
@@ -76,6 +86,16 @@ PROVENANCE_WHITELIST = {
     "core/Sources/DroidVMCore/Identity.swift",
     "scripts/check_repo.py",          # this file names the marker to look for
     "core/Tests/DroidVMCoreTests/IdentityTests.swift",
+    # Engine sources carry SPDX headers and, where a design was studied or a recipe adapted,
+    # a comment naming the upstream file. That is provenance, not branding: the guard exists
+    # to keep another project's name out of the product identity and out of user-facing text,
+    # and the brief is explicit that provenance must not be obscured to satisfy it.
+    "engine/native/droidvm_jit.c",
+    "engine/native/droidvm_display.c",
+    "engine/native/droidvm_runtime.c",
+    "engine/native/droidvm_native.h",
+    "engine/include/DroidVMBridge.h",
+    "engine/jit/droidvm-brk.S",
 }
 
 # Words that must not appear outside the whitelist. Kept deliberately short: this is a
@@ -220,6 +240,57 @@ def check_third_party_record():
 
 # ----------------------------------------------------------------- identity
 
+SYMBOL_MANIFEST = "engine/symbols/required-symbols.txt"
+
+# The only prefixes permitted in the manifest. `qemu_` comes from the engine; `droidvm_` is
+# DroidVM's own. Anything else is a typo or a symbol that belongs to nobody.
+ALLOWED_SYMBOL_PREFIXES = ("qemu_", "droidvm_")
+
+
+def check_symbol_manifest():
+    """The manifest must be well-formed, because two other gates trust it.
+
+    The host gate verifies every `droidvm_` entry is defined in the built objects; gate 3
+    verifies every entry is exported by the built dylib. Both read this file, so a duplicate
+    or a typo here would be believed by both.
+    """
+    path = os.path.join(ROOT, SYMBOL_MANIFEST.replace("/", os.sep))
+    if not os.path.isfile(path):
+        fail("missing symbol manifest: %s" % SYMBOL_MANIFEST)
+        return
+
+    symbols = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, 1):
+            entry = line.split("#", 1)[0].strip()
+            if not entry:
+                continue
+            if not entry.startswith(ALLOWED_SYMBOL_PREFIXES):
+                fail("%s:%d: %r does not start with qemu_ or droidvm_"
+                     % (SYMBOL_MANIFEST, lineno, entry))
+                continue
+            symbols.append(entry)
+
+    if not symbols:
+        fail("the symbol manifest lists nothing")
+        return
+
+    duplicates = sorted({s for s in symbols if symbols.count(s) > 1})
+    if duplicates:
+        fail("duplicate entries in the symbol manifest: %s" % ", ".join(duplicates))
+
+    droidvm_count = len([s for s in symbols if s.startswith("droidvm_")])
+    qemu_count = len([s for s in symbols if s.startswith("qemu_")])
+    if droidvm_count == 0:
+        fail("the symbol manifest declares no droidvm_ symbols")
+    if qemu_count == 0:
+        fail("the symbol manifest declares no qemu_ symbols; the engine's entry points "
+             "are the reason the manifest exists")
+
+    ok("symbol manifest: %d symbols (%d droidvm_, %d qemu_), no duplicates"
+       % (len(symbols), droidvm_count, qemu_count))
+
+
 def check_identity_values():
     """The bundle identifiers in the core package must be DroidVM's own."""
     path = os.path.join(ROOT, "core/Sources/DroidVMCore/Identity.swift")
@@ -306,6 +377,7 @@ def main():
     check_third_party_record()
     check_identity_values()
     check_script_modes()
+    check_symbol_manifest()
 
     for note in notes:
         print("  ok   %s" % note)

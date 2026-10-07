@@ -1,0 +1,44 @@
+# DroidVM's required engine symbols.
+#
+# One per line. '#' starts a comment; blank lines are ignored.
+#
+# WHY THIS IS A FILE AND NOT A LIST INSIDE A SCRIPT
+#
+# QEMU's shared-library build exports only the symbols named in `system/qemu.symbols`. A
+# symbol missing from that list **links successfully and fails at `dlopen`**, or later at
+# first use inside a vCPU thread -- which is a confusing way to lose a day. This manifest is
+# the single list of what DroidVM actually calls, so it can be checked in three places
+# instead of being retyped in each:
+#
+#   * the host gate verifies every DROIDVM symbol is DEFINED in the built native objects
+#   * gate 3 verifies every symbol here is EXPORTED by the built dylib
+#   * scripts/check_repo.py verifies the file itself is well-formed
+#
+# TWO GROUPS, AND THE DISTINCTION MATTERS
+#
+#   qemu_*     provided by QEMU. DroidVM resolves them from the shared library at runtime,
+#              which is why they are declared in DroidVMBridge.h but defined by the engine.
+#   droidvm_*  provided by DroidVM's own native sources. If one of these is missing, the
+#              engine was built without DroidVM's bridge and nothing will work.
+
+# --- QEMU's own entry points -------------------------------------------------
+qemu_init
+qemu_main_loop
+qemu_cleanup
+
+# --- DroidVM's executable-memory backend -------------------------------------
+droidvm_jit_probe
+droidvm_jit_capture
+droidvm_jit_release
+droidvm_jit_last_reason
+
+# --- DroidVM's display bridge ------------------------------------------------
+droidvm_display_register
+droidvm_display_read
+droidvm_display_is_attached
+droidvm_display_set_attached
+droidvm_display_counters_sizeof
+droidvm_display_last_reason
+
+# --- DroidVM's runtime support ----------------------------------------------
+droidvm_serial_bytes_written

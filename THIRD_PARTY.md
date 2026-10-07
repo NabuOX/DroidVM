@@ -50,6 +50,34 @@ That is a deliberate choice, not a technicality:
 | The three `brk` instruction pairs and the trap protocol | StikDebug's published script; also in the reference tree as `husk-brk.S` | the protocol is not copyrightable subject matter | **reimplemented** | `engine/jit/droidvm-brk.S` |
 | Machine stamp as a snapshot-compatibility identity | `src/app/Husk/QemuRunner.swift`, `machineStamp` | GPL-2.0-or-later | **reimplemented** | `QEMUMachineShape.stamp` |
 | SHA-256 for asset verification | none — published algorithm, FIPS 180-4 test vectors | public domain algorithm | **authored here** | `core/Sources/DroidVMCore/Assets/SHA256.swift` |
+
+### Phase 1.2 — the native bridge, and the reuse decisions behind it
+
+Each row below is a decision, not a description. The brief asked for one of three positions
+on every piece of low-level code, and the position is stated so that a later reader can
+disagree with it explicitly rather than by accident:
+
+* **A — clean reimplementation.** No code taken. Used wherever the *rules* are the valuable
+  part and copying would also copy a shape DroidVM does not want.
+* **B — adapted GPL-compatible implementation.** Structure or sequence taken, rewritten for
+  DroidVM's interfaces.
+* **C — direct reuse.** Only where adapting would add risk without architectural benefit.
+
+| Component | Source | License | Decision | Destination |
+|---|---|---|---|---|
+| Executable-memory mechanism: the trap protocol, the two-view mapping, the execute self-test | `src/ios-jit/husk-ios-jit.c`, itself derived from AetherPS4-iOS `ios_jit_allocator.cpp` | GPL-2.0-or-later | **A — reimplemented.** The status machine, the reason reporting and the ordering (self-test before any success is reported) are DroidVM's. The *failure modes* were studied, which is why the self-test exists at all | `engine/native/droidvm_jit.c` |
+| The three `brk` instruction pairs | StikDebug's published script; also `src/ios-jit/husk-brk.S` | the protocol is not copyrightable subject matter | **A — reimplemented** | `engine/jit/droidvm-brk.S` |
+| QEMU embedding: which entry points to resolve and how the machine is driven in-process | `src/app/Husk/QemuRunner.swift` | GPL-2.0-or-later | **A — reimplemented.** DroidVM resolves three symbols through `dlsym` behind `VMRuntimeBackend`; the reference drove QEMU from a single 2000-line god object, which is the architecture this project exists not to repeat | `engine/qemu/QEMURuntime.swift` |
+| Display listener: registering a `DisplayChangeListener` and counting each stage | `src/ios-jit/husk-display.c`, `husk-display-stats.h` | GPL-2.0-or-later | **A — reimplemented.** Six explicit per-stage entry points rather than a bump function, so a call site must say which stage it is in | `engine/native/droidvm_display.c` |
+| `-display none` plus DroidVM's own listener as the only backend | `src/app/Husk/QemuRunner.swift` | GPL-2.0-or-later | **A** — it is one argument, and the reasoning is in `QEMULaunchPlan` | `core/Sources/DroidVMCore/VM/QEMULaunchPlan.swift` |
+| Cross-compile recipe: `gen_cross`, the autotools and meson helpers, the per-dependency stages, the QEMU configure flag list, `ninja libqemu-aarch64-softmmu.dylib` | `scripts/build_ios.sh` | GPL-2.0-or-later | **B — adapted.** A working recipe for an arm64-ios QEMU, whose flags were found by running it. Neither authorable from scratch nor safe to leave as prose | `scripts/build_engine_ios.sh` |
+| Export-list maintenance: QEMU's shared-library build exports only `system/qemu.symbols`, so a missing symbol links and fails at `dlopen` | `scripts/integrate_husk.sh` | GPL-2.0-or-later | **B — adapted**, and made checkable: the list became a declared manifest with a host-gate and a gate-3 verification instead of a script's local array | `scripts/integrate_engine.sh`, `engine/symbols/required-symbols.txt` |
+| Bundle validation before packaging | `scripts/package_ipa.sh` | GPL-2.0-or-later | **B — adapted** | `scripts/package_ipa.sh` |
+| Dependency version pins | `scripts/sources.sh` | GPL-2.0-or-later (the pins) | **B — adapted** | `scripts/build_engine_ios.sh`, `THIRD_PARTY.md` |
+
+**No file was copied in Phase 1.2.** The two `B` rows take a *sequence* and a *flag list* --
+both of which are constrained by what cross-compiles, not by anyone's expression -- and
+rewrite them against DroidVM's own structure and its own manifest.
 | Bundle validation before packaging: the required Info.plist keys, the executable named by `CFBundleExecutable` actually existing, and every embedded dylib present | `scripts/package_ipa.sh` | GPL-2.0-or-later | **adapted** | `scripts/package_ipa.sh` |
 | The export-list maintenance insight: QEMU's shared-library build exports only `system/qemu.symbols`, so a missing symbol links and fails at `dlopen` | `scripts/integrate_husk.sh` | GPL-2.0-or-later | **adapted** | `scripts/integrate_engine.sh` |
 | Cross-compilation target triple and meson cross-file shape | `scripts/build_ios.sh`, `scripts/sources.sh` | GPL-2.0-or-later | **adapted** | `scripts/build_engine_ios.sh` |

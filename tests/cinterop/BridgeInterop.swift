@@ -1,53 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// C interop harness for the engine bridge.
+// Host harness for the engine bridge and the native implementation behind it.
 //
-// WHAT THIS PROVES
+// WHAT THIS LINKS
 //
-// `DroidVMBridge.h` declares an ABI and `engine/` uses it from Swift. Whether Swift can
-// actually consume that ABI is a question only a compiler answers, and it does not need
-// Apple frameworks to answer it:
+// The real `engine/native/*.c`, the real `engine/include/DroidVMBridge.h`, the real
+// `DroidVMCore` as a separate module, and the real `engine/jit/TrapExecutableMemory.swift`.
+// The only stand-in is QEMU's three entry points (tests/cinterop/qemu_shim.c), which cannot
+// be present on a host by definition.
 //
-//   * whether a plain C `typedef enum` imports as something `==` and `switch` work on
-//   * whether a C struct gets a usable memberwise initialiser
-//   * whether `size_t` arrives as `Int`, and `uint64_t` as `UInt64`
-//   * whether an out-parameter (`droidvm_jit_region *out`) is drivable with `&`
-//   * whether the C struct's layout matches the Swift view of it -- the check
-//     `MetalDisplaySurface.checkBridgeLayout()` performs at startup, executed for real here
-//   * whether `char **` survives the boundary in both directions -- the mechanism
-//     `QEMURuntime` uses to hand QEMU its argument vector
-//   * whether a function pointer resolved from a library can be called through a
-//     `@convention(c)` typealias -- the mechanism `QEMURuntime` uses to reach `qemu_init`
-//   * whether `const char *` converts to a `String` the way the error path assumes
+// So when this passes, DroidVM's own native code has been compiled with -Wall -Wextra
+// -Werror and exercised: the six display counters, the process-wide reset, the serial
+// saturating counter, the JIT status machine, and the error mapping that turns a C status
+// into a product-facing readiness.
 //
-// It also compiles against the REAL `DroidVMCore`, so constructing a `DisplayCounters` from
-// the C struct is exercised exactly as `MetalDisplaySurface` does it.
+// WHAT THIS DOES NOT PROVE
 //
-// WHAT IT DOES NOT PROVE
-//
-// Nothing about QEMU, Metal, the JIT, arm64, the iOS SDK or a device. The C bodies are
-// stand-ins returning synthetic values (see bridge_stub.c). This is an ABI harness. It is
-// not device verification and must never be reported as such.
+// Nothing about QEMU, Metal, the JIT trap itself, `vm_remap`, arm64, the iOS SDK or a
+// device. On this host the executable-memory mechanism is genuinely absent, and the tests
+// assert the *honest* consequence of that rather than faking a success path. The success
+// paths for the JIT are covered in the Swift unit tests, where the backend is explicitly a
+// simulated double named as such.
 
 import Foundation
 import CDroidVMBridge
+import CDroidVMNative
 import DroidVMCore
 
-// Stub-side test seams.
-@_silgen_name("droidvm_test_set_reason")
-func droidvm_test_set_reason(_ reason: UnsafePointer<CChar>?)
-
-@_silgen_name("droidvm_test_bump_counters")
-func droidvm_test_bump_counters(_ entered: UInt64, _ received: UInt64, _ presented: UInt64,
-                                _ dropped: UInt64, _ no_scanout: UInt64,
-                                _ present_failure: UInt64)
-
-@_silgen_name("droidvm_test_set_serial_bytes")
-func droidvm_test_set_serial_bytes(_ bytes: UInt64)
-
-// Stub-side inspection of the argv that crossed the boundary.
-@_silgen_name("droidvm_stub_qemu_init_argc")
-func droidvm_stub_qemu_init_argc() -> Int32
+// Shim inspection, test-only.
+@_silgen_name("droidvm_shim_qemu_init_calls")
+func shim_init_calls() -> Int32
+@_silgen_name("droidvm_shim_qemu_init_argc")
+func shim_init_argc() -> Int32
+@_silgen_name("droidvm_shim_qemu_main_loop_calls")
+func shim_main_loop_calls() -> Int32
+@_silgen_name("droidvm_shim_qemu_cleanup_calls")
+func shim_cleanup_calls() -> Int32
+@_silgen_name("droidvm_shim_qemu_init_argv0")
+func shim_argv0() -> UnsafePointer<CChar>?
+@_silgen_name("droidvm_shim_qemu_init_argv1")
+func shim_argv1() -> UnsafePointer<CChar>?
+@_silgen_name("droidvm_shim_qemu_reset")
+func shim_reset()
 
 var checks = 0
 var failures = 0
@@ -60,131 +54,199 @@ func check(_ condition: Bool, _ what: @autoclosure () -> String) {
     }
 }
 
-// The stub exposes its recording globals as C symbols; Swift sees them as mutable globals.
-@_silgen_name("g_qemu_init_argc")
-var g_qemu_init_argc: Int32
-
-@_silgen_name("g_qemu_init_calls")
-var g_qemu_init_calls: Int32
-
-@_silgen_name("g_qemu_main_loop_calls")
-var g_qemu_main_loop_calls: Int32
-
-@_silgen_name("g_qemu_cleanup_calls")
-var g_qemu_cleanup_calls: Int32
-
-@_silgen_name("g_probe_result")
-var g_probe_result: Int32
-
-@_silgen_name("g_capture_result")
-var g_capture_result: Int32
-
-@_silgen_name("g_qemu_init_argv0")
-var g_qemu_init_argv0: (CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
-                        CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
-                        CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar,
-                        CChar, CChar, CChar, CChar, CChar, CChar, CChar, CChar)
-
-// MARK: - 1. struct layout
+// MARK: - 1. ABI: struct layout
 
 func testCounterStructLayout() {
-    print("counter struct: does Swift's view match C's?")
+    print("abi: does Swift's view of the counter struct match C's?")
 
-    // This is the check the engine performs once at startup and refuses to run without.
-    // A mismatch here would produce plausible, wrong numbers rather than a crash, which is
-    // worse: they would be believed.
     let swiftSize = MemoryLayout<droidvm_display_counters>.size
     let cSize = Int(droidvm_display_counters_sizeof())
     check(swiftSize == cSize,
-          "droidvm_display_counters: Swift sees \(swiftSize) bytes, C reports \(cSize)")
+          "Swift sees \(swiftSize) bytes, C reports \(cSize)")
 
-    // Field widths, asserted individually so a partial mismatch is named.
     check(MemoryLayout.size(ofValue: droidvm_display_counters().entered) == 8,
           "entered must be 64-bit")
-    check(MemoryLayout.size(ofValue: droidvm_display_counters().presented) == 8,
-          "presented must be 64-bit")
+    check(MemoryLayout.size(ofValue: droidvm_display_counters().present_failure) == 8,
+          "present_failure must be 64-bit")
 
-    // The memberwise initialiser the engine relies on exists.
     let zero = droidvm_display_counters(entered: 0, received: 0, presented: 0,
                                         dropped: 0, no_scanout: 0, present_failure: 0)
-    check(zero.presented == 0, "memberwise init works")
+    check(zero.presented == 0, "the memberwise initialiser exists")
 }
 
-// MARK: - 2. counters read path
+// MARK: - 2. the six counters, through the real native code
 
-func testCounterReadPath() {
-    print("counters: read the C struct and build a real DisplayCounters")
+func testSixStagesThroughRealNativeCode() {
+    print("counters: drive each of the six stages through the real native API")
 
-    droidvm_test_bump_counters(10, 9, 8, 1, 2, 3)
+    droidvm_native_reset()
+    var raw = droidvm_display_counters()
+    droidvm_display_read(&raw)
+    check(raw.entered == 0 && raw.received == 0 && raw.presented == 0
+          && raw.dropped == 0 && raw.no_scanout == 0 && raw.present_failure == 0,
+          "a fresh machine starts from all zeroes")
+
+    // Each stage is a separate entry point, so each is driven separately. The counts are
+    // all DIFFERENT on purpose: if any two note functions wrote the same counter, the
+    // values would collide and the assertions below would catch it. (An earlier version of
+    // this test used counts that happened to coincide and then asserted they were distinct,
+    // which was a bug in the test rather than in the code.)
+    droidvm_display_note_entered()
+    droidvm_display_note_entered()
+    droidvm_display_note_entered()
+    droidvm_display_note_entered()
+    droidvm_display_note_entered()
+    droidvm_display_note_received()
+    droidvm_display_note_presented()
+    droidvm_display_note_presented()
+    droidvm_display_note_dropped()
+    droidvm_display_note_dropped()
+    droidvm_display_note_dropped()
+    droidvm_display_note_no_scanout()
+    droidvm_display_note_no_scanout()
+    droidvm_display_note_no_scanout()
+    droidvm_display_note_no_scanout()
+    droidvm_display_note_present_failure()
+    droidvm_display_note_present_failure()
+    droidvm_display_note_present_failure()
+    droidvm_display_note_present_failure()
+    droidvm_display_note_present_failure()
+    droidvm_display_note_present_failure()
+
+    droidvm_display_read(&raw)
+    check(raw.entered == 5, "entered: \(raw.entered)")
+    check(raw.received == 1, "received: \(raw.received)")
+    check(raw.presented == 2, "presented: \(raw.presented)")
+    check(raw.dropped == 3, "dropped: \(raw.dropped)")
+    check(raw.no_scanout == 4, "no_scanout: \(raw.no_scanout)")
+    check(raw.present_failure == 6, "present_failure: \(raw.present_failure)")
+
+    // The whole point: no two stages shared a counter. If `dropped` and `no_scanout` had
+    // been the same field, both would read 7 here.
+    let values = [raw.entered, raw.received, raw.presented,
+                  raw.dropped, raw.no_scanout, raw.present_failure]
+    check(Set(values).count == 6,
+          "all six stages must be separately observable, got \(values)")
+    check(values.reduce(0, +) == 21,
+          "and every increment landed somewhere: total \(values.reduce(0, +))")
+
+    // And the portable classifier consumes it, so the C side and the Swift rules agree.
+    let counters = DisplayCounters(entered: raw.entered, received: raw.received,
+                                   presented: raw.presented, dropped: raw.dropped,
+                                   noScanout: raw.no_scanout,
+                                   presentFailure: raw.present_failure)
+    check(counters.hasEverPresented, "the readiness rule reads the real counters")
+    let cause = StallClassifier.classify(
+        window: counters,
+        context: DisplayContext(attached: true, hasGraphicsContext: true))
+    check(cause == .presented, "a window that presented classifies as presented")
+
+    // A window of pure guest silence is not a stall.
+    droidvm_native_reset()
+    droidvm_display_note_entered()
+    droidvm_display_note_no_scanout()
+    droidvm_display_read(&raw)
+    let silent = DisplayCounters(entered: raw.entered, received: raw.received,
+                                 presented: raw.presented, dropped: raw.dropped,
+                                 noScanout: raw.no_scanout,
+                                 presentFailure: raw.present_failure)
+    check(StallClassifier.classify(
+            window: silent,
+            context: DisplayContext(attached: true, hasGraphicsContext: true)) == .noScanout,
+          "asked to draw with nothing to draw is noScanout, not a drop")
+}
+
+// MARK: - 3. reset is process-wide
+
+func testResetIsComplete() {
+    print("reset: a second machine must not inherit the first machine's counters")
+
+    droidvm_display_note_entered()
+    droidvm_display_note_presented()
+    droidvm_display_set_attached(1)
+    droidvm_serial_note_bytes(4096)
+
+    droidvm_native_reset()
 
     var raw = droidvm_display_counters()
     droidvm_display_read(&raw)
-
-    check(raw.entered == 10, "entered arrived: \(raw.entered)")
-    check(raw.received == 9, "received arrived: \(raw.received)")
-    check(raw.presented == 8, "presented arrived: \(raw.presented)")
-    check(raw.dropped == 1, "dropped arrived: \(raw.dropped)")
-    check(raw.no_scanout == 2, "no_scanout arrived: \(raw.no_scanout)")
-    check(raw.present_failure == 3, "present_failure arrived: \(raw.present_failure)")
-
-    // Exactly the mapping MetalDisplaySurface performs.
-    let counters = DisplayCounters(entered: raw.entered,
-                                   received: raw.received,
-                                   presented: raw.presented,
-                                   dropped: raw.dropped,
-                                   noScanout: raw.no_scanout,
-                                   presentFailure: raw.present_failure)
-
-    check(counters.presented == 8, "DisplayCounters carried the value")
-    check(counters.hasEverPresented, "and the readiness rule reads correctly")
-
-    // And the classifier consumes it, so the whole path is exercised.
-    let cause = StallClassifier.classify(window: counters,
-                                         context: DisplayContext(attached: true,
-                                                                 hasGraphicsContext: true))
-    check(cause == .presented, "a window with frames presented classifies as presented")
-
-    // The six stages stayed distinct across the boundary: this is the rule that a single
-    // frame counter cannot express, so it is worth asserting end to end.
-    check(counters.entered != counters.received
-          && counters.received != counters.presented
-          && counters.presented != counters.dropped,
-          "the six stages must not be conflated by the bridge")
+    check(raw.entered == 0 && raw.presented == 0, "display counters cleared")
+    check(droidvm_display_is_attached() == 0, "attachment cleared")
+    check(droidvm_serial_bytes_written() == 0, "serial counter cleared")
 }
 
-// MARK: - 3. display attachment
+// MARK: - 4. attachment and registration
 
-func testDisplayAttachment() {
-    print("display: attachment flag and one-listener rule")
+func testAttachmentAndRegistration() {
+    print("display: attachment flag, and registration refusing a second listener")
 
+    droidvm_native_reset()
     check(droidvm_display_is_attached() == 0, "detached to begin with")
+
     droidvm_display_set_attached(1)
     check(droidvm_display_is_attached() == 1, "attach is visible to C")
+
+    // On this host the build has no QEMU, so registration must report *that* -- not
+    // "already registered", which would be a different and misleading diagnosis.
+    let code = droidvm_display_register()
+    check(code == 2, "a build without the engine reports code 2, got \(code)")
+
+    if let reason = droidvm_display_last_reason() {
+        let text = String(cString: reason)
+        check(text.contains("DROIDVM_WITH_QEMU"),
+              "and the reason names how to fix it: '\(text)'")
+    } else {
+        check(false, "droidvm_display_last_reason returned nil")
+    }
+
     droidvm_display_set_attached(0)
     check(droidvm_display_is_attached() == 0, "detach is visible to C")
-
-    // A second registration must be refused; a second listener would orphan the first
-    // surface, which shows up as a frame counter climbing against a black screen.
-    let first = droidvm_display_register()
-    check(first == 0, "the first registration succeeds")
-    let second = droidvm_display_register()
-    check(second != 0, "a second registration is refused")
+    if let reason = droidvm_display_last_reason() {
+        check(String(cString: reason).contains("detached"),
+              "losing the surface records a reason")
+    }
 }
 
-// MARK: - 4. C enum import
+// MARK: - 5. serial saturates rather than wrapping
 
-func testCEnumInterop() {
-    print("C enum: comparison and switch over an imported typedef enum")
+func testSerialSaturates() {
+    print("serial: saturating counter, because wrapping would read as silence")
 
-    // Plain C enums do not arrive as Swift enums; how they behave is exactly the kind of
-    // thing that must be checked rather than assumed.
+    droidvm_serial_reset()
+    droidvm_serial_note_bytes(1000)
+    check(droidvm_serial_bytes_written() == 1000, "counts normally")
+
+    droidvm_serial_note_bytes(500)
+    check(droidvm_serial_bytes_written() == 1500, "and accumulates")
+
+    // A large value added to a zeroed counter is stored exactly. (Starting from a non-zero
+    // total here would itself overflow, which is what an earlier version of this test got
+    // wrong -- the test was broken, not the counter.)
+    droidvm_serial_reset()
+    droidvm_serial_note_bytes(UInt64.max - 10)
+    check(droidvm_serial_bytes_written() == UInt64.max - 10,
+          "a large non-overflowing value is stored exactly")
+
+    droidvm_serial_note_bytes(1000)
+    check(droidvm_serial_bytes_written() == UInt64.max,
+          "and overflow saturates at the maximum rather than wrapping to zero, which "
+          + "would make a chatty guest look silent")
+
+    droidvm_serial_reset()
+    check(droidvm_serial_bytes_written() == 0, "reset works")
+}
+
+// MARK: - 6. C enum interop and the JIT status machine
+
+func testCEnumAndJITStatus() {
+    print("jit: C enum interop, and the honest answer on a host with no mechanism")
+
     let ok: droidvm_jit_status = DROIDVM_JIT_OK
     check(ok == DROIDVM_JIT_OK, "equality against a same-named constant")
-    check(ok != DROIDVM_JIT_NOT_PERMITTED, "and inequality against a different one")
+    check(ok != DROIDVM_JIT_UNSUPPORTED, "and inequality against a different one")
 
-    // Switch with static-member patterns, which is how the engine dispatches on status.
-    func describe(_ status: droidvm_jit_status) -> String {
-        switch status {
+    func describe(_ s: droidvm_jit_status) -> String {
+        switch s {
         case DROIDVM_JIT_OK: return "ok"
         case DROIDVM_JIT_NOT_PERMITTED: return "not permitted"
         case DROIDVM_JIT_ALLOCATION_FAILED: return "allocation failed"
@@ -194,260 +256,167 @@ func testCEnumInterop() {
         default: return "other"
         }
     }
+    check(describe(DROIDVM_JIT_UNSUPPORTED) == "unsupported",
+          "switch dispatches on a C enum")
 
-    check(describe(DROIDVM_JIT_OK) == "ok", "switch dispatches on a C enum")
-    check(describe(DROIDVM_JIT_SELF_TEST_FAILED) == "self test failed",
-          "and reaches a later case")
+    // This host genuinely has no executable-memory mechanism, so the platform test must say
+    // so rather than claiming availability it cannot honour.
+    check(droidvm_jit_platform_supported() == 0,
+          "the development host is not a supported platform, and says so")
+    let probe = droidvm_jit_probe()
+    check(probe == DROIDVM_JIT_UNSUPPORTED,
+          "probe reports unsupported rather than pretending, got \(describe(probe))")
 
-    // Mapping onto DroidVM's own error type, which is what TrapExecutableMemory does.
-    func mapped(_ status: droidvm_jit_status) -> ExecutableMemoryError {
-        switch status {
-        case DROIDVM_JIT_NOT_PERMITTED: return .notPermitted(reason: "x")
-        case DROIDVM_JIT_ALLOCATION_FAILED: return .allocationFailed(reason: "x")
-        case DROIDVM_JIT_SELF_TEST_FAILED: return .selfTestFailed(reason: "x")
-        case DROIDVM_JIT_UNSUPPORTED: return .unsupportedPlatform(reason: "x")
-        default: return .alreadyHeld(regionBytes: 0)
+    // Capture must refuse for the same reason, not fail with an allocation error -- those
+    // map to different DroidVM errors and therefore to different user-facing outcomes.
+    var region = droidvm_jit_region(executable: nil, writable: nil, size: 0)
+    let captured = droidvm_jit_capture(4096, &region)
+    check(captured == DROIDVM_JIT_UNSUPPORTED,
+          "capture reports unsupported, got \(describe(captured))")
+    check(region.size == 0, "and writes nothing into the out-parameter on failure")
+
+    // A null out-parameter is a caller bug and is refused, not dereferenced.
+    let nullOut = droidvm_jit_capture(4096, nil)
+    check(nullOut == DROIDVM_JIT_ALLOCATION_FAILED,
+          "a null out-parameter is refused rather than crashing")
+
+    // Zero bytes is refused too: a zero-length region cannot be self-tested.
+    var zeroRegion = droidvm_jit_region(executable: nil, writable: nil, size: 0)
+    check(droidvm_jit_capture(0, &zeroRegion) == DROIDVM_JIT_ALLOCATION_FAILED,
+          "zero bytes is refused")
+
+    // Release with nothing held is not an error.
+    check(droidvm_jit_release() == DROIDVM_JIT_OK, "releasing nothing succeeds")
+
+    if let reason = droidvm_jit_last_reason() {
+        check(!String(cString: reason).isEmpty, "a reason is always available")
+    }
+}
+
+// MARK: - 7. the real Swift adapter, over the real native code
+
+func testRealAdapterOverRealNativeCode() async {
+    print("adapter: TrapExecutableMemory + JITManager over the real C, on a host")
+
+    let backend = TrapExecutableMemory()
+
+    // The adapter must translate "unsupported platform" into an environment limitation,
+    // which is the distinction that decides whether the app sends someone hunting a bug.
+    do {
+        _ = try backend.acquire(bytes: 4096)
+        check(false, "acquire should have thrown on a host with no mechanism")
+    } catch let error as ExecutableMemoryError {
+        if case .unsupportedPlatform(let reason) = error {
+            check(error.isEnvironmentLimitation,
+                  "an unsupported platform is an environment limitation, not a fault")
+            check(!reason.isEmpty, "and carries the C-side reason: '\(reason)'")
+        } else {
+            check(false, "expected unsupportedPlatform, got \(error)")
         }
+    } catch {
+        check(false, "wrong error type: \(error)")
     }
-    check(mapped(DROIDVM_JIT_NOT_PERMITTED).isEnvironmentLimitation,
-          "a permission refusal maps to an environment limitation")
-    check(!mapped(DROIDVM_JIT_SELF_TEST_FAILED).isEnvironmentLimitation,
-          "a self-test failure maps to a fault, not an environment limitation")
+
+    check(backend.probe() == .unavailable(reason: "no executable-memory mechanism on this "
+                                          + "platform (build targets arm64-apple-ios)")
+          || !backend.probe().isAvailable,
+          "probe does not claim availability")
+
+    // And the manager above it: the product-facing outcome is `unavailable`, with a plain
+    // reason -- not `failed`. Nothing is broken; the platform simply cannot do it.
+    let recorder = DiagnosticsRecorder()
+    let ring = RingBufferSink()
+    recorder.add(ring)
+    let manager = JITManager(backend: backend, requestedBytes: 1 << 20, recorder: recorder)
+
+    let readiness = await manager.prepareRuntime()
+    if case .unavailable(let why) = readiness {
+        check(readiness.isActionableByUser, "unavailable is actionable by the user")
+        check(!why.contains("vm_remap") && !why.contains("errno"),
+              "the product-facing reason must be plain language, got '\(why)'")
+    } else {
+        check(false, "expected .unavailable on a host, got \(readiness)")
+    }
+
+    // The technical detail is retained separately, for diagnostics only.
+    check(manager.technicalDetail.contains("unsupported")
+          || manager.technicalDetail.contains("attempts="),
+          "technical detail is kept out of the product state: '\(manager.technicalDetail)'")
+
+    // The failure is in the stream, with a machine-readable reason.
+    let names = ring.contents.compactMap { line -> String? in
+        guard let d = line.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+        else { return nil }
+        return o["event"] as? String
+    }
+    check(names.contains("runtime_prepare_started"), "the attempt is recorded: \(names)")
+    check(names.contains("runtime_failed"), "and so is the outcome")
 }
 
-// MARK: - 5. out-parameters and pointer round-trip
+// MARK: - 8. strings and the argument vector
 
-func testJITOutParameter() {
-    print("jit: out-parameter, pointer round-trip, and the acquire/release lifecycle")
+func testStringsAndArgumentVector() {
+    print("strings and argv: across the boundary in both directions")
 
-    _ = droidvm_jit_release()
-    g_capture_result = 0     // DROIDVM_JIT_OK
-    g_probe_result = 0
-
-    var raw = droidvm_jit_region(executable: nil, writable: nil, size: 0)
-    let status = droidvm_jit_capture(4096, &raw)
-
-    check(status == DROIDVM_JIT_OK, "capture reported success")
-    check(raw.size == 4096, "the out-parameter carried the size back: \(raw.size)")
-    check(raw.executable != nil, "the executable view was filled in")
-    check(raw.writable != nil, "the writable view was filled in")
-    check(raw.executable != raw.writable,
-          "the two views must be distinct: the split is the whole technique")
-
-    // The conversion ExecutableRegion performs.
-    let region = ExecutableRegion(executableAddress: UInt(bitPattern: raw.executable),
-                                  writableAddress: UInt(bitPattern: raw.writable),
-                                  size: raw.size)
-    check(region.size == 4096, "ExecutableRegion built from the C struct")
-    check(region.executableAddress != 0, "and the address survived the round trip")
-
-    // A second capture must be refused rather than leaking the first region.
-    var second = droidvm_jit_region(executable: nil, writable: nil, size: 0)
-    let refused = droidvm_jit_capture(4096, &second)
-    check(refused == DROIDVM_JIT_ALREADY_HELD,
-          "a second capture is refused while one is held, got \(refused)")
-
-    _ = droidvm_jit_release()
-
-    // Failure branches, each mapping to a different DroidVM error.
-    g_capture_result = 3     // DROIDVM_JIT_SELF_TEST_FAILED
-    var third = droidvm_jit_region(executable: nil, writable: nil, size: 0)
-    check(droidvm_jit_capture(4096, &third) == DROIDVM_JIT_SELF_TEST_FAILED,
-          "the self-test failure branch is reachable")
-    g_capture_result = 0
-}
-
-// MARK: - 6. const char * to String
-
-func testStringReturn() {
-    print("strings: const char * into String, the way the error path reads a reason")
-
-    let reason = "no debugger attached"
-    reason.withCString { droidvm_test_set_reason($0) }
-
-    guard let raw = droidvm_jit_last_reason() else {
-        return check(false, "droidvm_jit_last_reason returned nil")
+    // const char * -> String.
+    droidvm_native_reset()
+    if let reason = droidvm_display_last_reason() {
+        check(String(cString: reason) == "display state reset",
+              "the known reason round-trips: '\(String(cString: reason))'")
+    } else {
+        check(false, "droidvm_display_last_reason returned nil")
     }
-    let text = String(cString: raw)
-    check(text == reason, "the reason round-tripped: '\(text)'")
 
-    // The empty-string edge, which a naive implementation traps on.
-    "".withCString { droidvm_test_set_reason($0) }
-    if let empty = droidvm_jit_last_reason() {
-        check(String(cString: empty).isEmpty, "an empty reason reads as empty, not a crash")
-    }
-}
-
-// MARK: - 7. char ** across the boundary, and a function pointer call
-
-func testArgumentVectorAndFunctionPointer() {
-    print("argv: build a char ** in Swift, read it back in C, then call through a pointer")
-
-    let arguments = ["droidvm-engine", "-M", "virt", "-smp", "4"]
-    var argv = arguments.map { strdup($0) }
-    argv.append(nil)
-
-    check(argv.count == arguments.count + 1, "argv is nil-terminated")
-
-    // The exact typealias QEMURuntime uses for a symbol resolved from the library.
+    // char ** in, read back out of C. The typealias matches QEMURuntime's.
+    shim_reset()
     typealias InitFn = @convention(c) (Int32,
                                        UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?)
         -> Int32
     typealias LoopFn = @convention(c) () -> Int32
     typealias CleanupFn = @convention(c) () -> Void
 
-    // In the engine these come from dlsym; here they are taken directly, which exercises
-    // the same typealias and the same call convention.
-    let initPtr = unsafeBitCast(qemu_init as InitFn, to: UnsafeMutableRawPointer.self)
-    let initFn = unsafeBitCast(initPtr, to: InitFn.self)
+    let arguments = ["droidvm-engine", "-M", "virt", "-smp", "4"]
+    var argv = arguments.map { strdup($0) }
+    argv.append(nil)
+
+    let initFn = unsafeBitCast(qemu_init as InitFn, to: InitFn.self)
     let loopFn = unsafeBitCast(qemu_main_loop as LoopFn, to: LoopFn.self)
     let cleanupFn = unsafeBitCast(qemu_cleanup as CleanupFn, to: CleanupFn.self)
 
-    let initResult = initFn(Int32(argv.count - 1), &argv)
-    check(initResult == 0, "qemu_init reported success through the pointer")
-    check(g_qemu_init_calls == 1, "and was called once")
-    check(g_qemu_init_argc == Int32(arguments.count),
-          "argc arrived intact: \(g_qemu_init_argc) vs \(arguments.count)")
+    check(initFn(Int32(argv.count - 1), &argv) == 0, "qemu_init succeeded through a pointer")
+    check(shim_init_calls() == 1, "and was called once")
+    check(shim_init_argc() == Int32(arguments.count),
+          "argc arrived intact: \(shim_init_argc())")
 
-    // argv[0] read back out of the C side, which is what makes this a real round trip
-    // rather than a call that merely did not crash.
-    let argv0 = withUnsafePointer(to: &g_qemu_init_argv0) {
-        $0.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
-    }
-    check(argv0 == "droidvm-engine", "argv[0] round-tripped: '\(argv0)'")
+    if let p = shim_argv0() { check(String(cString: p) == "droidvm-engine", "argv[0]")
+    } else { check(false, "argv[0] nil") }
+    if let p = shim_argv1() { check(String(cString: p) == "-M", "argv[1]")
+    } else { check(false, "argv[1] nil") }
 
-    let loopResult = loopFn()
-    check(loopResult == 0, "qemu_main_loop was called through the pointer")
+    check(loopFn() == 0, "qemu_main_loop through a pointer")
+    check(shim_main_loop_calls() == 1, "counted")
     cleanupFn()
-    check(g_qemu_cleanup_calls == 1, "qemu_cleanup was called through the pointer")
+    check(shim_cleanup_calls() == 1, "qemu_cleanup through a pointer")
 
-    for pointer in argv where pointer != nil { free(pointer) }
-}
-
-// MARK: - 8. serial
-
-func testSerialCounter() {
-    print("serial: uint64_t return value")
-    droidvm_test_set_serial_bytes(123_456)
-    check(droidvm_serial_bytes_written() == 123_456, "a 64-bit return value arrives intact")
-}
-
-// MARK: - 9. the real engine adapter
-
-/// `TrapExecutableMemory` is compiled into this harness for real -- it needs only Foundation,
-/// DroidVMCore and the bridge header, so the host can compile and exercise it. That makes it
-/// the one engine adapter whose *behaviour* is verified outside macOS, against a stand-in C
-/// side. What is still unverified for it is the trap itself and `vm_remap`.
-func testRealEngineJITAdapter() {
-    print("engine: TrapExecutableMemory, the real adapter, against the stand-in C side")
-
-    _ = droidvm_jit_release()
-    g_capture_result = 0
-    g_probe_result = 0
-
-    let backend = TrapExecutableMemory()
-
-    // The honesty rule: before a capture, "is executable memory available?" has no answer.
-    // `OK` from the probe means the mechanism is present, not that a region exists, and
-    // reporting `.available` here would be a claim the adapter cannot support.
-    let probe = backend.probe()
-    check(probe == .unknown,
-          "probe before capture must be unknown, got \(probe)")
-    check(!probe.isAvailable, "and must not claim availability")
-
-    do {
-        let region = try backend.acquire(bytes: 8192)
-        check(region.size == 8192, "acquire returned the region")
-        check(region.executableAddress != 0 && region.writableAddress != 0,
-              "both views have addresses")
-        check(region.executableAddress != region.writableAddress,
-              "and they are distinct: the split is the technique, not an optimisation")
-    } catch {
-        check(false, "acquire threw unexpectedly: \(error)")
-    }
-
-    // Holding twice must be refused rather than leaking the first region.
-    do {
-        _ = try backend.acquire(bytes: 8192)
-        check(false, "a second acquire should have been refused")
-    } catch let error as ExecutableMemoryError {
-        if case .alreadyHeld = error {
-            check(true, "")
-        } else {
-            check(false, "expected alreadyHeld, got \(error)")
-        }
-    } catch {
-        check(false, "wrong error type: \(error)")
-    }
-
-    backend.release()
-    _ = droidvm_jit_release()
-
-    // A self-test failure is a fault, not an environment limitation, and the adapter must
-    // classify it correctly -- the distinction decides whether the app sends someone
-    // looking for a bug.
-    g_capture_result = 3     // DROIDVM_JIT_SELF_TEST_FAILED
-    do {
-        _ = try TrapExecutableMemory().acquire(bytes: 4096)
-        check(false, "acquire should have thrown")
-    } catch let error as ExecutableMemoryError {
-        if case .selfTestFailed = error {
-            check(!error.isEnvironmentLimitation,
-                  "a self-test failure must not read as an environment limitation")
-            check(!error.plainReason.isEmpty, "and must carry a plain reason")
-        } else {
-            check(false, "expected selfTestFailed, got \(error)")
-        }
-    } catch {
-        check(false, "wrong error type: \(error)")
-    }
-
-    // A permission refusal is an environment limitation.
-    g_capture_result = 1     // DROIDVM_JIT_NOT_PERMITTED
-    "no debugger attached".withCString { droidvm_test_set_reason($0) }
-    do {
-        _ = try TrapExecutableMemory().acquire(bytes: 4096)
-        check(false, "acquire should have thrown")
-    } catch let error as ExecutableMemoryError {
-        if case .notPermitted(let reason) = error {
-            check(error.isEnvironmentLimitation,
-                  "a permission refusal IS an environment limitation")
-            check(reason == "no debugger attached",
-                  "and the C-side reason must survive into Swift: '\(reason)'")
-        } else {
-            check(false, "expected notPermitted, got \(error)")
-        }
-    } catch {
-        check(false, "wrong error type: \(error)")
-    }
-
-    // A probe that refuses is an environment limitation before anything is attempted.
-    g_capture_result = 0
-    g_probe_result = 1       // DROIDVM_JIT_NOT_PERMITTED
-    if case .unavailable = TrapExecutableMemory().probe() {
-        check(true, "")
-    } else {
-        check(false, "a refusing probe must report unavailable")
-    }
-    g_probe_result = 0
+    for p in argv where p != nil { free(p) }
 }
 
 @main
 struct BridgeInterop {
-    static func main() {
-        print("DroidVM engine bridge interop harness")
-        print("(ABI and bridging only. No QEMU, no Metal, no device.)")
+    static func main() async {
+        print("DroidVM engine bridge + native harness")
+        print("(real native C and the real Swift adapters; QEMU's entry points are shims)")
         print("")
 
         testCounterStructLayout()
-        testCounterReadPath()
-        testDisplayAttachment()
-        testCEnumInterop()
-        testJITOutParameter()
-        testStringReturn()
-        testArgumentVectorAndFunctionPointer()
-        testSerialCounter()
-        testRealEngineJITAdapter()
+        testSixStagesThroughRealNativeCode()
+        testResetIsComplete()
+        testAttachmentAndRegistration()
+        testSerialSaturates()
+        testCEnumAndJITStatus()
+        await testRealAdapterOverRealNativeCode()
+        testStringsAndArgumentVector()
 
         print("")
         print("\(checks) checks, \(failures) failure(s)")

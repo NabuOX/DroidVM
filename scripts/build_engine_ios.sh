@@ -34,6 +34,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+MANIFEST="$ROOT/engine/symbols/required-symbols.txt"
 VENDOR="$ROOT/engine/vendor"
 BUILD="$ROOT/build/ios-arm64"
 STAGE="$ROOT/build/ios-arm64/lib"
@@ -123,11 +124,22 @@ echo "  libiconv $LIBICONV_VERSION, gettext $GETTEXT_VERSION,"
 echo "  libucontext $LIBUCONTEXT_COMMIT, libslirp $LIBSLIRP_VERSION"
 echo "  (fetched and cross-compiled into $BUILD; see THIRD_PARTY.md for licences)"
 #
-# The per-dependency build steps are deliberately NOT written out here. Each needs its own
-# configure/meson invocation whose flags are discovered by running it, and a script written
-# without ever being run would be a plausible-looking fiction. The reference implementation's
-# working sequence is in its scripts/build_ios.sh, which is recorded in THIRD_PARTY.md as
-# reference material; that is what this stage should be derived from, run, and corrected.
+# The per-dependency build steps are being transcribed from a recipe that is known to work
+# for arm64-ios -- the reference implementation's scripts/build_ios.sh, recorded in
+# THIRD_PARTY.md as an adapted (class B) source. The sequence is:
+#
+#   autotools:  libffi, pixman   (pixman with a patch: pixman-0.38.0.patch)
+#   meson:      glib, libucontext (-Dfreestanding=true), libslirp (with a patch)
+#   qemu:       configure in _droidvm_build, then `ninja libqemu-aarch64-softmmu.dylib`
+#
+# They are NOT implemented below, and that is deliberate rather than unfinished. Each needs a
+# configure invocation whose flags are discovered by running it; a script written without ever
+# being run would be a plausible-looking fiction, and the failure would appear as a confusing
+# error deep inside somebody else's configure step. Transcribing them is the next concrete
+# step, and it requires a macOS runner to do honestly.
+#
+# What IS done: the pins above, the cross-file below, the export manifest, and the
+# verification that fails loudly when a required symbol is absent.
 
 # --------------------------------------------------------- integrate engine
 #
@@ -164,25 +176,61 @@ if [ ! -f "$STAGE/libqemu-aarch64-softmmu.dylib" ]; then
 fi
 
 echo
-echo "==> verifying the exported symbols DroidVM calls"
-SYMBOLS="$(xcrun nm -gU "$STAGE/libqemu-aarch64-softmmu.dylib" 2>/dev/null || true)"
+echo
+echo "==> SYMBOL VERIFICATION against $MANIFEST"
+
+if [ ! -f "$MANIFEST" ]; then
+    echo "  FAIL: the symbol manifest is missing; nothing declares what must be exported" >&2
+    exit 1
+fi
+
+DYLIB="$STAGE/libqemu-aarch64-softmmu.dylib"
+EXPORTS="$(xcrun nm -gU "$DYLIB" 2>/dev/null | awk '{print $3}' | sed 's/^_//' | sort -u)"
+
 missing=0
-for symbol in _qemu_init _qemu_main_loop _qemu_cleanup \
-              _droidvm_jit_probe _droidvm_jit_capture _droidvm_jit_release \
-              _droidvm_display_register _droidvm_display_read \
-              _droidvm_display_counters_sizeof; do
-    if echo "$SYMBOLS" | grep -q " $symbol$"; then
-        printf '  ok       %s\n' "$symbol"
+declared_count=0
+while IFS= read -r raw; do
+    symbol="$(echo "$raw" | sed 's/#.*//' | tr -d '[:space:]')"
+    [ -z "$symbol" ] && continue
+    declared_count=$((declared_count + 1))
+    if echo "$EXPORTS" | grep -qx "$symbol"; then
+        printf '  %-46s exported\n' "$symbol"
     else
-        printf '  MISSING  %s   <-- links fine, fails at dlopen\n' "$symbol" >&2
-        missing=1
+        printf '  %-46s MISSING   <-- links fine, fails at dlopen\n' "$symbol" >&2
+        missing=$((missing + 1))
+    fi
+done < "$MANIFEST"
+
+# And the reverse: a DroidVM bridge symbol that reached the dylib without being declared is a
+# symbol nothing validated. Reported rather than ignored, because the manifest is the only
+# record of what DroidVM's Swift side is allowed to resolve.
+undeclared=0
+for exported in $(echo "$EXPORTS" | grep '^droidvm_' || true); do
+    if ! grep -qE "^[[:space:]]*${exported}[[:space:]]*$" "$MANIFEST"; then
+        printf '  %-46s EXPORTED BUT UNDECLARED\n' "$exported" >&2
+        undeclared=$((undeclared + 1))
     fi
 done
-[ $missing -eq 0 ] || { echo "==> export list is incomplete" >&2; exit 1; }
 
+if [ "$missing" -ne 0 ] || [ "$undeclared" -ne 0 ]; then
+    echo
+    echo "  SYMBOL VERIFICATION: FAIL ($missing missing, $undeclared undeclared)" >&2
+    exit 1
+fi
+echo
+echo "  SYMBOL VERIFICATION: PASS ($declared_count declared symbols all exported)"
+
+# ------------------------------------------------------------------ report
+#
+# Four layers, reported separately because a failure in one is not a failure in another.
+# A build that compiles everything and fails to link is a different problem from one that
+# fails to compile, and collapsing them loses the diagnosis.
 echo
 echo "================================================================"
-echo " ENGINE LINK: PASS"
-echo "   $STAGE/libqemu-aarch64-softmmu.dylib"
-echo "   every symbol DroidVM calls is exported"
+echo " NATIVE COMPILE : PASS (engine/native/*.c for $TARGET)"
+echo " SWIFT COMPILE  : see gate 2 (scripts/typecheck_ios.sh)"
+echo " ENGINE LINK    : PASS ($DYLIB, $declared_count symbols verified)"
+echo " APP LINK       : see gate 4 (scripts/package_ipa.sh)"
+echo " SIGNING        : NOT REQUIRED (unsigned IPA, re-signed by the installer)"
+echo " DEVICE TEST    : NOT RUN"
 echo "================================================================"

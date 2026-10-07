@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    DroidVM's bundle metadata.
+
+    Written by hand rather than generated, which is why scripts/package_ipa.sh validates it:
+    Xcode does not inject CFBundleIdentifier or CFBundleExecutable when a custom
+    INFOPLIST_FILE is supplied without GENERATE_INFOPLIST_FILE, and a bundle missing either
+    builds and zips perfectly happily and then fails to install with no useful message.
+
+    Identity is DroidVM's throughout. Nothing here names another project.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>DroidVM</string>
+
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleName</key>
+    <string>DroidVM</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>MinimumOSVersion</key>
+    <string>16.4</string>
+
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+    </array>
+
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+
+    <!-- Required from iOS 14. An app with a SwiftUI lifecycle and no launch screen of any
+         kind is rejected at install. -->
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <!-- arm64 only. DroidVM's executable-memory mechanism and its trap protocol are
+             arm64-specific, so the app is not installable on anything else rather than
+             failing later in a way that looks like a bug. -->
+        <string>arm64</string>
+    </array>
+
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <!-- Whether the app may be used on a Mac. Not a target, and stated so. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+
+    <!-- Build identity, stamped by scripts/package_ipa.sh so a log can name the build that
+         produced it. A log from a stale install is otherwise indistinguishable from a log
+         proving a fix did not work. -->
+    <key>DroidVMBuildCommit</key>
+    <string>unstamped</string>
+
+    <key>DroidVMBuildDate</key>
+    <string>unstamped</string>
+
+    <!-- The engine is QEMU, GPLv2 as a whole, and shipping it in an IPA distributes a
+         combined work. The source offer is the repository. -->
+    <key>DroidVMLicense</key>
+    <string>GPL-2.0-or-later</string>
+</dict>
+</plist>
