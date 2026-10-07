@@ -176,11 +176,9 @@ else
     MANIFEST="$ROOT/engine/symbols/required-engine-symbols.txt"
     EXPORTS="$DD/bundle-exports.txt"
     nm -gU "$QEMU_LIB" 2>/dev/null | awk '{print $NF}' | sed 's/^_//' | sort -u > "$EXPORTS"
-    if bash "$ROOT/scripts/check_engine_symbols.sh" "$MANIFEST" "$EXPORTS" \
-            > "$DD/symbols.log" 2>&1; then
+    if bash "$ROOT/scripts/check_engine_symbols.sh" "$MANIFEST" "$EXPORTS" > /dev/null; then
         printf "  ok       %-28s %s\n" "engine exports" "all present"
     else
-        cat "$DD/symbols.log" >&2
         rc=1
     fi
 
