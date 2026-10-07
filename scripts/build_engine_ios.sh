@@ -507,6 +507,74 @@ run_qemu() {
 
 # ---------------------------------------------------------------- SYMBOL VERIFY
 
+# Extract the function names DroidVMBridge.h DECLARES.
+#
+# NOT a regex over the raw file, and the reason is not style.
+#
+# The previous version was:
+#
+#     grep -oE '\\b(droidvm_[a-z_]+|qemu_[a-z_]+)\\(' engine/include/DroidVMBridge.h
+#
+# which is a malformed ERE: the doubled backslashes turn `\(` into a literal backslash
+# followed by a group-opening `(`, so the pattern has two `(` and one `)` and grep refuses with
+# "parentheses not balanced". It cost a gate-3 run.
+#
+# Fixing the escaping would still have been wrong. A name mentioned in a COMMENT is not a
+# declaration, and a regex over raw text cannot tell them apart -- it would demand that a
+# symbol nobody declares appear in the manifest, which is the same class of error pointing the
+# other way. So comments are removed first, by a small state machine, and the identifier before
+# each '(' is taken from what remains. No pattern spans a parenthesis.
+#
+# It is a function rather than an inline pipeline so it can be tested off-macOS: this script
+# exits 2 without Xcode. scripts/check_host.sh extracts it and proves a declaration is matched,
+# a comment-only mention is rejected, and an input yielding nothing is refused rather than
+# accepted.
+extract_bridge_declarations() {
+    local header="$1"
+    [ -f "$header" ] || die "no bridge header at $header"
+
+    local stripped names
+    stripped="$(awk '
+        {
+            line = $0; out = ""; i = 1
+            while (i <= length(line)) {
+                two = substr(line, i, 2)
+                if (incomment) {
+                    if (two == "*/") { incomment = 0; i += 2 } else { i += 1 }
+                } else if (two == "/*") {
+                    incomment = 1; i += 2
+                } else if (two == "//") {
+                    break
+                } else {
+                    out = out substr(line, i, 1); i += 1
+                }
+            }
+            print out
+        }' "$header")"
+
+    [ -n "$stripped" ] || die "comment stripping produced nothing from $header"
+
+    # Split on '(' and take the trailing identifier of each preceding fragment. No regex here
+    # spans a parenthesis, so there is nothing to unbalance.
+    names="$(printf '%s\n' "$stripped" | awk '
+        {
+            n = split($0, parts, "(")
+            for (i = 1; i < n; i++) {
+                if (match(parts[i], /[A-Za-z_][A-Za-z0-9_]*$/)) {
+                    print substr(parts[i], RSTART, RLENGTH)
+                }
+            }
+        }' | grep -E '^(droidvm_|qemu_)' | sort -u)"
+
+    # A check that extracts nothing passes vacuously -- it would report "no undeclared
+    # symbols" about an empty set. That is the false-pass class this project keeps finding, so
+    # it is refused here rather than trusted.
+    [ -n "$names" ] || die "no droidvm_/qemu_ declarations were extracted from $header; \
+the manifest cross-check would pass vacuously"
+
+    printf '%s\n' "$names"
+}
+
 run_symbols() {
     banner "SYMBOL VERIFY"
     local dylib="$STAGED_LIB/libqemu-aarch64-softmmu.dylib"
@@ -563,8 +631,8 @@ run_symbols() {
     # Every symbol the public bridge header declares must be in the manifest, or a Swift call
     # would reach a symbol nothing validated.
     local header_symbols undeclared=0
-    header_symbols="$(grep -oE '\\b(droidvm_[a-z_]+|qemu_[a-z_]+)\\(' \
-                      engine/include/DroidVMBridge.h | tr -d '(' | sort -u)"
+    header_symbols="$(extract_bridge_declarations engine/include/DroidVMBridge.h)"
+    echo "  bridge header declares $(printf '%s\n' "$header_symbols" | wc -l | tr -d ' ') symbol(s)"
     for exported in $header_symbols; do
         if ! grep -qE "^[[:space:]]*${exported}[[:space:]]*$" "$MANIFEST"; then
             printf '  %-46s DECLARED IN BRIDGE, ABSENT FROM MANIFEST\n' "$exported" >&2

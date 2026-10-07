@@ -187,6 +187,88 @@ else
     fi
 fi
 rm -f "$GUARD_BODY"
+
+# extract_bridge_declarations: must read DECLARATIONS, not names mentioned in comments, and
+# must refuse to pass on an input it cannot extract anything from. The malformed-regex failure
+# this replaces reached CI because nothing tested the extraction on its own.
+EXTRACT_BODY="$(mktemp)"
+sed -n '/^extract_bridge_declarations() {/,/^}/p' "$ROOT/scripts/build_engine_ios.sh" \
+    > "$EXTRACT_BODY"
+if [ ! -s "$EXTRACT_BODY" ]; then
+    echo "  FAIL: could not extract extract_bridge_declarations" >&2
+    stage_fail "extract_bridge_declarations extraction"
+else
+    FIXTURE="$(mktemp)"
+    cat > "$FIXTURE" <<'FIXTURE_EOF'
+/* A block comment mentioning droidvm_comment_only( which is NOT a declaration. */
+int droidvm_declared_one(int argc, char **argv);
+void qemu_declared_two(void);
+// A line comment mentioning droidvm_also_comment_only(
+int droidvm_declared_three(void);
+/* trailing */
+FIXTURE_EOF
+
+    # The extracted body only DEFINES the function. It has to be called, and the call has to
+    # be appended -- an earlier version extracted the definition and ran it, which printed
+    # nothing and exited 0, so every assertion below "failed" against empty output.
+    run_extract() {
+        { echo 'die() { exit 1; }'
+          cat "$EXTRACT_BODY"
+          printf 'extract_bridge_declarations "$1"\n'
+        } > "$EXTRACT_BODY.run"
+        bash "$EXTRACT_BODY.run" "$1"
+    }
+
+    got="$(run_extract "$FIXTURE" 2>/dev/null || true)"
+    for expected in droidvm_declared_one qemu_declared_two droidvm_declared_three; do
+        if printf '%s\n' "$got" | grep -qx "$expected"; then
+            echo "  ok   extracts the declaration $expected"
+        else
+            echo "  FAIL did not extract the declaration $expected" >&2
+            stage_fail "extract_bridge_declarations missed $expected"
+        fi
+    done
+    for forbidden in droidvm_comment_only droidvm_also_comment_only; do
+        if printf '%s\n' "$got" | grep -qx "$forbidden"; then
+            echo "  FAIL accepted '$forbidden', which appears only in a comment" >&2
+            stage_fail "extract_bridge_declarations accepted a comment mention"
+        else
+            echo "  ok   rejects the comment-only mention $forbidden"
+        fi
+    done
+
+    # An input with no declarations must be REFUSED, not silently produce an empty set.
+    EMPTY_FIXTURE="$(mktemp)"
+    printf '/* only a comment, droidvm_nothing( */\n' > "$EMPTY_FIXTURE"
+    if run_extract "$EMPTY_FIXTURE" >/dev/null 2>&1; then
+        echo "  FAIL accepted an input with no declarations (the check would pass vacuously)" >&2
+        stage_fail "extract_bridge_declarations accepted an empty extraction"
+    else
+        echo "  ok   refuses an input it cannot extract from"
+    fi
+
+    # The real header, through the same extracted function. It must find every symbol the
+    # manifest expects, or the cross-check downstream is comparing against a short list.
+    real_decls="$(run_extract "$ROOT/engine/include/DroidVMBridge.h" 2>/dev/null || true)"
+    real_count="$(printf '%s\n' "$real_decls" | grep -c . || true)"
+    echo "  ok   the real header extracts $real_count declaration(s)"
+    for must_have in qemu_init qemu_main_loop qemu_cleanup droidvm_jit_capture \
+                     droidvm_display_register droidvm_serial_bytes_written; do
+        if printf '%s\n' "$real_decls" | grep -qx "$must_have"; then
+            :
+        else
+            echo "  FAIL the real header extraction missed $must_have" >&2
+            stage_fail "extract_bridge_declarations missed $must_have in the real header"
+        fi
+    done
+    if [ "$real_count" -lt 14 ]; then
+        echo "  FAIL the real header should yield at least 14 declarations, got $real_count" >&2
+        stage_fail "extract_bridge_declarations returned too few from the real header"
+    else
+        echo "  ok   it finds all 14 declared symbols in the real bridge header"
+    fi
+    rm -f "$FIXTURE" "$EMPTY_FIXTURE" "$EXTRACT_BODY" "$EXTRACT_BODY.run"
+fi
 echo
 
 echo "================================================================"
