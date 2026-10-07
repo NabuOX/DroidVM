@@ -57,6 +57,10 @@ REQUIRED_FILES = [
     "engine/native/droidvm_runtime.c",
     "engine/jit/droidvm-brk.S",
     "engine/symbols/required-symbols.txt",
+    "engine/patches/README.md",
+    "engine/patches/pixman-0.38.0.patch",
+    "engine/patches/libslirp-v4.9.1.patch",
+    ".github/workflows/engine-link.yml",
     "core/Package.swift",
 ]
 
@@ -96,6 +100,9 @@ PROVENANCE_WHITELIST = {
     "engine/native/droidvm_native.h",
     "engine/include/DroidVMBridge.h",
     "engine/jit/droidvm-brk.S",
+    # engine/patches/README.md documents the upstream patches that are deliberately NOT
+    # vendored, which requires naming them. That is provenance, not branding.
+    "engine/patches/README.md",
 }
 
 # Words that must not appear outside the whitelist. Kept deliberately short: this is a

@@ -155,15 +155,39 @@ judgement that should not be made silently.
 
 Versions and provenance verified against the reference project's dependency pins.
 
-| Component | Source | License | Reuse | Destination |
+### Level C — the engine's dependency set, and why each one is there
+
+Five libraries, not seven. The reference also builds libiconv and gettext; DroidVM's QEMU is
+configured without the features that reach them, so they are not fetched. Three more —
+virglrenderer, libepoxy and MoltenVK — are absent because DroidVM's default display is the
+software path, so `--disable-opengl --disable-virglrenderer` removes the whole GPU stack from
+Level C. Enabling `QEMUDisplayMode.gpu` later brings them back.
+
+| Library | Source | Revision | Licence | Configure flags | Artefact | Why DroidVM needs it |
+|---|---|---|---|---|---|---|
+| libffi | `libffi/libffi` release | **3.5.0** | MIT | autotools, `--host=aarch64-apple-darwin --enable-static --disable-shared` | `libffi.a` | QEMU's FFI plumbing; `configure` refuses without it |
+| glib | GNOME | **2.83.0** | LGPL-2.1-or-later | meson, ios cross-file; `-Dtests=false -Dnls=disabled -Dintrospection=disabled -Dselinux=disabled -Dlibmount=disabled -Ddtrace=disabled -Dman-pages=disabled -Dglib_debug=disabled -Dxattr=false` | `libglib-2.0.a`, `libgmodule-2.0.a`, `libgobject-2.0.a` | QEMU's core data structures and main loop |
+| pixman | cairographics | **0.38.0** | MIT | autotools + `pixman-0.38.0.patch`; `--disable-gtk --disable-libpng --disable-arm-iwmmxt` | `libpixman-1.a` | QEMU's software rasteriser — the reason the software display path works at all |
+| libucontext | `utmapp/libucontext` | commit **`9b1d8f01a6e99166f9808c79966abe10786de8b6`** | ISC | meson, ios cross-file; `-Dfreestanding=true` | `libucontext.a` | the iOS SDK withholds `makecontext`/`swapcontext`, which QEMU's coroutines need; pinned by commit because the Darwin/arm64 assembly fixes are what make it work |
+| libslirp | `utmapp/libslirp` release mirror | **4.9.1** | BSD-3-Clause | meson, **darwin** cross-file + `libslirp-v4.9.1.patch` | `libslirp.a` | QEMU's user-mode networking — what `-netdev user` means, and the launch plan always configures one |
+
+Downloads are pinned by URL and by revision, and their SHA-256 digests are recorded into
+`engine/deps-digests.txt` on first fetch and verified from then on. That makes the build
+byte-reproducible from the second run without anyone having to guess a hash in advance, and it
+does not block the first run on a digest that does not exist yet.
+
+### Level C — patches
+
+| Patch | Upstream project | Licence | Reuse | Why |
 |---|---|---|---|---|
-| glib 2.83 | GNOME | LGPL-2.1-or-later | planned: as-is | engine sysroot |
-| pixman 0.38.0 | cairographics | MIT | planned: as-is | engine sysroot |
-| libffi 3.5.0 | libffi project | MIT | planned: as-is | engine sysroot |
-| libiconv 1.16 | GNU | LGPL-2.1 (library) | planned: as-is | engine sysroot |
-| gettext 0.22.5 | GNU | LGPL-2.1+ (libintl) | planned: as-is | engine sysroot |
-| libucontext | `utmapp/libucontext` `9b1d8f0` | ISC | planned: as-is | engine sysroot |
-| libslirp 4.9.1 | `utmapp/libslirp` release | BSD-3-Clause | planned: as-is | engine sysroot |
+| `pixman-0.38.0.patch` | pixman (the patch comes from UTM's `patches/`) | MIT | **C — direct reuse**, byte-identical | makes pixman's autotools build cross-compile: trims `SUBDIRS` to drop host-only demos/tests, and repairs an automake mismatch a newer host automake produces |
+| `libslirp-v4.9.1.patch` | libslirp | BSD-3-Clause | **C — direct reuse**, byte-identical | teaches `meson.build` that `ios` behaves like `darwin`, so `resolv` is linked; without it the link fails later with undefined resolver symbols |
+
+Full reasoning, including the three patches deliberately **not** vendored, is in
+`engine/patches/README.md`.
+
+QEMU itself: fetched as UTM's release tarball `v10.0.12-utm`, which is GPL-2.0 and already
+carries UTM's QEMU changes — that is why `qemu-10.0.12-utm.patch` is not applied to it.
 
 The LGPL components are linked into a GPL work, which LGPL permits; they are consumed as
 libraries, unchanged, and their sources are published upstream.

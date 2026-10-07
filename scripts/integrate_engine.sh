@@ -23,6 +23,21 @@
 #
 # Adapted from the reference implementation's integration script; see THIRD_PARTY.md. The
 # reasoning above is that script's, and it is the reason this one exists as its own step.
+#
+# NOT CALLED YET, AND THAT IS DELIBERATE
+#
+# scripts/build_engine_ios.sh does not invoke this, because at this stage DroidVM's bridge
+# compiles into the APP target and nothing needs to live inside QEMU's tree.
+#
+# It will be needed, and the reason is worth naming rather than rediscovering. The display
+# listener is a QEMU `DisplayChangeListener`, registered with QEMU's display system, and the
+# six counters are written from QEMU's callbacks -- so the listener and the counters must be in
+# the same image. That means moving the bridge into the dylib and having the Swift adapters
+# resolve `droidvm_*` through `dlsym` exactly as they resolve `qemu_*`.
+#
+# Copying the bridge into QEMU's tree first would put two sets of counters in one process, and
+# the app would read the wrong one. So the order is: prove the link (Level C), then move the
+# bridge, then make the machine run.
 set -euo pipefail
 
 QEMU_TREE="${1:-}"

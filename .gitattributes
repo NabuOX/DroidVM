@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# git attributes for DroidVM.
+
+# Vendored patches are byte-identical copies of upstream diffs, and their whitespace IS the
+# payload: a context line's leading space and a removed line's trailing whitespace are what
+# makes the patch apply. `git diff --check` flags both, which is correct for source files and
+# wrong here -- "fixing" the whitespace would silently stop the patch applying, and the
+# symptom would appear much later as a dependency that will not build.
+#
+# Recorded as an exemption rather than by editing the files, and the files are verified
+# byte-identical to their upstream copies.
+engine/patches/*.patch -whitespace

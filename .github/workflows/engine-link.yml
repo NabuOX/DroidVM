@@ -1,0 +1,142 @@
+# DroidVM gate 3: the engine link.
+#
+# Separate from ci.yml because it takes HOURS on a cold cache (QEMU plus five dependencies),
+# so it does not belong in the per-push path. It runs when the engine, its build scripts or
+# its patches change -- which is exactly when it can tell you something -- and on demand.
+#
+# THE SIX LAYERS ARE SIX STEPS, deliberately. A failure in one is not a failure in another,
+# and collapsing them into one opaque "build the engine" step loses the diagnosis: "the engine
+# did not build" is not actionable, "glib configured but pixman's make failed" is. Each stage
+# stamps its work, so a later layer does not redo an earlier one's hours.
+#
+# This gate does NOT download a guest image and does NOT boot Android. The app dlopens the
+# engine at runtime rather than linking against it, so proving the link needs no guest bytes.
+# LEVEL D IS NOT RUN, and a green run here is not evidence about a device.
+
+name: engine-link
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'engine/**'
+      - 'scripts/build_engine_ios.sh'
+      - 'scripts/integrate_engine.sh'
+      - 'scripts/typecheck_ios.sh'
+      - 'app/project.yml'
+      - 'app/DroidVMApp/**'
+      - '.github/workflows/engine-link.yml'
+
+concurrency:
+  group: engine-link-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  engine-link:
+    name: gate 3 - engine link
+    runs-on: macos-14
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reported unconditionally, so a passing run records which toolchain produced its
+      # artifact and a failing one is attributable rather than guessed at.
+      - name: environment
+        run: |
+          set -x
+          uname -m
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          swift --version
+          swiftc --version
+          xcrun --sdk iphoneos clang --version
+
+      # Installed rather than assumed. A missing meson otherwise fails deep inside a
+      # dependency's configure step, where the error does not name the real problem.
+      - name: build tools
+        run: |
+          brew install meson ninja pkg-config xcodegen
+          meson --version && ninja --version && pkg-config --version && xcodegen --version
+
+      # Cache the dependency sysroot and the QEMU build tree. Without this every run pays the
+      # full hours again, which makes iterating on a failure impractical.
+      - name: cache engine build
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/ios-arm64/sysroot
+            build/ios-arm64/stamps
+            engine/vendor
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/native/**', 'engine/deps-digests.txt') }}
+          restore-keys: |
+            engine-${{ runner.os }}-
+
+      # ---------------------------------------------------------------- layer 1
+      - name: 1. DEPENDENCIES
+        run: ./scripts/build_engine_ios.sh deps
+
+      # ---------------------------------------------------------------- layer 2
+      - name: 2. NATIVE ENGINE
+        run: ./scripts/build_engine_ios.sh native
+
+      # ---------------------------------------------------------------- layer 3
+      - name: 3. QEMU
+        run: ./scripts/build_engine_ios.sh qemu
+
+      # ---------------------------------------------------------------- layer 4
+      - name: 4. SYMBOL VERIFY
+        run: ./scripts/build_engine_ios.sh symbols
+
+      # ---------------------------------------------------------------- layer 5
+      - name: 5. SWIFT ENGINE
+        run: ./scripts/build_engine_ios.sh swift
+
+      # ---------------------------------------------------------------- layer 6
+      - name: 6. APP LINK
+        run: ./scripts/build_engine_ios.sh app
+
+      # ---------------------------------------------------------------- report
+      #
+      # Only reached if all six passed, so it cannot report a result it did not observe.
+      - name: layers
+        run: |
+          {
+            echo "DEPENDENCIES  PASS"
+            echo "NATIVE ENGINE PASS"
+            echo "QEMU          PASS"
+            echo "SYMBOL VERIFY PASS"
+            echo "SWIFT ENGINE  PASS"
+            echo "APP LINK      PASS"
+            echo "SIGNING       NOT REQUIRED - unsigned"
+            echo "DEVICE TEST   NOT RUN - gate 5 is a human with a phone"
+            echo "LEVEL C       PASS"
+            echo "LEVEL D       NOT RUN"
+          } | tee build/engine-link-result.txt
+
+      - name: artifact report
+        run: |
+          ls -lh build/ios-arm64/lib/ || true
+          lipo -archs build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib || true
+          du -sh build/ios-arm64/derived/Build/Products/Release-iphoneos/DroidVM.app || true
+
+      - name: upload engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidVM-engine-arm64-ios
+          path: |
+            build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib
+            build/engine-link-result.txt
+          if-no-files-found: error
+
+      # On failure, the configure logs are the whole diagnosis and they are inside the
+      # dependency directories. Uploaded so they are readable without a token.
+      - name: upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidVM-engine-build-logs
+          path: build/ios-arm64/logs/
+          if-no-files-found: warn
