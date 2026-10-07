@@ -93,8 +93,8 @@ jobs:
       # a missing one otherwise fails deep inside a dependency's configure step.
       - name: build tools
         run: |
-          brew install meson ninja pkg-config || true
-          meson --version && ninja --version && pkg-config --version
+          brew install meson ninja pkg-config xcodegen || true
+          meson --version && ninja --version && pkg-config --version && xcodegen --version
 
       - name: build the engine for iOS
         run: ./scripts/build_engine_ios.sh

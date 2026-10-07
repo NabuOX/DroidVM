@@ -81,12 +81,20 @@ fi
 echo "==> COMPILE PASS"
 echo "==> LINK PASS"
 
+# ---------------------------------------------------------------- bundle paths
+#
+# The engine library comes from the verified engine build. One canonical path, and the runtime looks
+# in exactly one place that matches it: DroidVM.app/Frameworks.
+ENGINE_LIB="${DROIDVM_ENGINE_LIB:-$ROOT/build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib}"
+APP="$DD/Build/Products/Release-iphoneos/$APP_NAME.app"
+
 # ---------------------------------------------------------------- embed the engine
 #
 # Packaging owns this because the dylib is a runtime dependency the app loads dynamically through
 # dlopen, not a link-time one. There is deliberately no Xcode build phase and no linkage between the
 # app target and QEMU -- the app target must never compile QEMU-internal sources.
 echo "==> embedding the engine"
+[ -d "$APP" ] || { echo "error: no app bundle at $APP" >&2; exit 1; }
 [ -f "$ENGINE_LIB" ] || {
     echo "error: no engine library at $ENGINE_LIB" >&2
     echo "       build it first: ./scripts/build_engine_ios.sh deps qemu" >&2
@@ -94,13 +102,6 @@ echo "==> embedding the engine"
 }
 mkdir -p "$APP/Frameworks"
 cp -f "$ENGINE_LIB" "$APP/Frameworks/libqemu-aarch64-softmmu.dylib"
-
-# The engine library, from the verified engine build. One canonical path, and the runtime looks
-# in exactly one place that matches it: DroidVM.app/Frameworks.
-ENGINE_LIB="${DROIDVM_ENGINE_LIB:-$ROOT/build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib}"
-
-APP="$DD/Build/Products/Release-iphoneos/$APP_NAME.app"
-[ -d "$APP" ] || { echo "error: no app bundle at $APP" >&2; exit 1; }
 
 # ---------------------------------------------------------------- stamp
 #
