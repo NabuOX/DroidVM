@@ -61,16 +61,15 @@ jobs:
           brew install meson ninja pkg-config xcodegen
           meson --version && ninja --version && pkg-config --version && xcodegen --version
 
-      # Cache the dependency sysroot and the QEMU build tree. Without this every run pays the
-      # full hours again, which makes iterating on a failure impractical.
-      - name: cache engine build
-        uses: actions/cache@v4
+      # Restore the dependency sysroot and the QEMU build tree; without it every run pays hours.
+      - name: restore engine cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             build/ios-arm64/sysroot
             build/ios-arm64/stamps
             engine/vendor
-          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/native/**', 'engine/deps-digests.txt') }}
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
           restore-keys: |
             engine-${{ runner.os }}-
 
@@ -85,6 +84,17 @@ jobs:
       # ---------------------------------------------------------------- layer 3
       - name: 3. QEMU
         run: ./scripts/build_engine_ios.sh qemu
+
+      # Save immediately after QEMU so later failures preserve the build. No `if: success()` --
+      # that is a step's default condition, and it is what keeps a partial build out of the cache.
+      - name: save engine cache after a successful QEMU build
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/ios-arm64/sysroot
+            build/ios-arm64/stamps
+            engine/vendor
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
 
       # ---------------------------------------------------------------- layer 4
       - name: 4. SYMBOL VERIFY

@@ -422,6 +422,22 @@ else
     check 1 "the glob finds Meson's directory-prefixed object name"
 fi
 
+# ---------------------------------------------------------------- CI cache placement
+#
+# `actions/cache` saves in a post-job step that GitHub SKIPS when the job fails, so a successful
+# QEMU build was discarded whenever a later stage failed. The workflow looked correct; only the
+# PLACEMENT was wrong, which is the kind of defect that returns silently.
+WORKFLOW="$ROOT/.github/workflows/engine-link.yml"
+save_line="$(grep -n "save engine cache after a successful QEMU build" "$WORKFLOW" | head -1 | cut -d: -f1)"
+symbol_line="$(grep -n "4. SYMBOL VERIFY" "$WORKFLOW" | head -1 | cut -d: -f1)"
+if grep -q "actions/cache/restore@v4" "$WORKFLOW" \
+   && grep -q "actions/cache/save@v4" "$WORKFLOW" \
+   && [ -n "$save_line" ] && [ -n "$symbol_line" ] && [ "$save_line" -lt "$symbol_line" ]; then
+    check 0 "engine cache: explicit restore, and save before SYMBOL VERIFY (line $save_line)"
+else
+    check 1 "engine cache: explicit restore, and save before SYMBOL VERIFY (save=${save_line:-none} symbol=${symbol_line:-none})"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "  integration regression: PASS ($pass checks)"
