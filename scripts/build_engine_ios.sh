@@ -641,8 +641,13 @@ run_symbols() {
     done
     [ "$undeclared" -eq 0 ] || die "$undeclared bridge declaration(s) are not in the manifest"
 
-    echo "  SYMBOL VERIFY: PASS ($declared declared: $from_dylib from the engine, "
-         "$from_app from the app; engine is arm64)"
+    # Three short statements, deliberately. This used to be one echo split across two lines
+    # with no continuation: the second line began with a quote, so the shell read it as a
+    # COMMAND name and failed with "command not found" -- after every check had already
+    # succeeded, which made a passing layer look like a failing one.
+    echo "  SYMBOL VERIFY: PASS"
+    echo "    $declared declared: $from_dylib exported by the engine, $from_app defined in the app"
+    echo "    engine architecture verified: arm64"
 }
 
 # ---------------------------------------------------------------- SWIFT ENGINE
