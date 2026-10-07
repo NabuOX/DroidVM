@@ -96,15 +96,12 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
         // directory, which is not where an embedded library lives, so Frameworks is resolved
         // explicitly rather than inferred.
         let libraryFile = "\(Self.libraryName).dylib"
-        var candidates: [URL] = []
-        if let frameworks = Bundle.main.privateFrameworksURL {
-            candidates.append(frameworks.appendingPathComponent(libraryFile))
-        }
-        // A narrow fallback: the host interop harness has no app bundle, so it stages the library
-        // among the resources instead. Production always takes the path above.
-        if let bundled = Bundle.main.path(forResource: Self.libraryName, ofType: "dylib") {
-            candidates.append(URL(fileURLWithPath: bundled))
-        }
+        // Frameworks first: that is where scripts/package_ipa.sh puts it. The resource lookup is a
+        // narrow fallback for the host harness, which has no app bundle.
+        let candidates = [
+            Bundle.main.privateFrameworksURL?.appendingPathComponent(libraryFile),
+            Bundle.main.url(forResource: Self.libraryName, withExtension: "dylib"),
+        ].compactMap { $0 }
         guard let resolved = candidates.first(where: {
             FileManager.default.fileExists(atPath: $0.path)
         }) else {
