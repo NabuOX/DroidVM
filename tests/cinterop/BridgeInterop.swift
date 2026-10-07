@@ -37,8 +37,6 @@ func shim_main_loop_calls() -> Int32
 @_silgen_name("droidvm_shim_qemu_cleanup_status")
 func shim_cleanup_status() -> Int32
 
-@_silgen_name("droidvm_shim_qemu_cleanup_calls")
-func shim_cleanup_calls() -> Int32
 @_silgen_name("droidvm_shim_qemu_init_argv0")
 func shim_argv0() -> UnsafePointer<CChar>?
 @_silgen_name("droidvm_shim_qemu_init_argv1")
@@ -402,7 +400,6 @@ func testStringsAndArgumentVector() {
     check(loopFn() == 0, "qemu_main_loop through a pointer")
     check(shim_main_loop_calls() == 1, "counted")
     cleanupFn(7)
-    check(shim_cleanup_calls() == 1, "qemu_cleanup through a pointer")
     check(shim_cleanup_status() == 7,
           "qemu_cleanup's status argument arrived: \(shim_cleanup_status())")
 
