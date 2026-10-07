@@ -789,9 +789,12 @@ run_app() {
     ( cd app && xcodegen generate --quiet ) || die "xcodegen could not generate the project"
 
     local log="$LOGS/app-link.log" rc=0
+
+    # Avoid device discovery hangs on runners without attached devices.
     set +e
     xcodebuild -project app/DroidVM.xcodeproj -scheme DroidVM \
         -sdk iphoneos -configuration Release -derivedDataPath "$BUILD/derived" \
+        -destination 'generic/platform=iOS' \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
         build > "$log" 2>&1
     rc=$?
