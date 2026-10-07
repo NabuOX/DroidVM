@@ -183,17 +183,27 @@ static droidvm_jit_status make_views(size_t bytes,
     }
 
     /* The writable alias. VM_PROT_READ|VM_PROT_WRITE here, and the two views are distinct
-     * mappings of the same physical pages. */
+     * mappings of the same physical pages.
+     *
+     * `vm_remap`, not `mach_vm_remap`. Both exist and on arm64 they are the same width, but
+     * they are different families with different headers:
+     *
+     *   vm_*        <mach/vm_map.h>     vm_allocate, vm_protect, vm_deallocate, vm_remap
+     *   mach_vm_*   <mach/mach_vm.h>    mach_vm_allocate, mach_vm_remap, ...
+     *
+     * Every other call in this function is the natural-width `vm_*` family, so mixing in one
+     * `mach_vm_*` call was an inconsistency rather than a deliberate choice -- and it did not
+     * compile, because <mach/mach_vm.h> is not included. Using `vm_remap` keeps the function
+     * in one family and needs no additional header. */
     vm_address_t writable = 0;
     vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
-    kr = mach_vm_remap(mach_task_self(), (mach_vm_address_t *)&writable,
-                       (mach_vm_size_t)size, 0,
-                       VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
-                       mach_task_self(), (mach_vm_address_t)base, FALSE,
-                       &cur, &max, VM_INHERIT_NONE);
+    kr = vm_remap(mach_task_self(), &writable, (vm_size_t)size, 0,
+                  VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
+                  mach_task_self(), base, FALSE,
+                  &cur, &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
         vm_deallocate(mach_task_self(), base, size);
-        droidvm_jit_set_reason("mach_vm_remap for the writable alias failed "
+        droidvm_jit_set_reason("vm_remap for the writable alias failed "
                                "(kern_return %d)", (int)kr);
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
