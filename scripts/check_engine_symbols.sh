@@ -51,7 +51,11 @@ done < "$MANIFEST"
 # And the object must exist. A symbol can only come from a compiled source, so this is what
 # separates "wired into Meson" from "copied into the tree and forgotten".
 if [ -n "$BUILD_DIR" ]; then
-    found="$(find "$BUILD_DIR" -name 'droidvm_qemu_runtime.c.o' 2>/dev/null | head -1)"
+    # GLOB on the suffix, because Meson prefixes the object with its source directory:
+    # libcommon.a.p/droidvm_droidvm_qemu_runtime.c.o
+    # Matching the bare filename would never find it and the check would fail on a build that
+    # compiled the module correctly.
+    found="$(find "$BUILD_DIR" -name '*droidvm_qemu_runtime.c.o' 2>/dev/null | head -1)"
     [ -n "$found" ] || {
         echo "FAIL: droidvm_qemu_runtime.c.o was never produced; the Meson integration did not compile it" >&2
         exit 1

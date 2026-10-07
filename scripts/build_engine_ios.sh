@@ -654,6 +654,11 @@ the manifest cross-check would pass vacuously"
 
 run_symbols() {
     banner "SYMBOL VERIFY"
+    # Derived HERE, not inherited. `dir` is local to run_qemu and does not exist in this
+    # function -- CI runs the stages as separate invocations, so a stage that borrowed
+    # another stage's local failed with "dir: unbound variable". Every run_* function must
+    # be independently executable.
+    local qemu_build_dir="$SRC/$QEMU_SRC_NAME/_droidvm_build"
     local dylib="$STAGED_LIB/libqemu-aarch64-softmmu.dylib"
     [ -f "$dylib" ] || die "no dylib to verify"
 
@@ -732,7 +737,7 @@ run_symbols() {
     "$ROOT/scripts/check_engine_symbols.sh" \
         "$ROOT/engine/symbols/required-engine-symbols.txt" \
         "$engine_exports" \
-        "$dir/_droidvm_build" \
+        "$qemu_build_dir" \
         || die "the built engine is missing required DroidVM runtime symbols"
 
     echo "  SYMBOL VERIFY: PASS"

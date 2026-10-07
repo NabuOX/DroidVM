@@ -356,6 +356,72 @@ else
     check 1 "build_engine_ios.sh parses"
 fi
 
+# ---------------------------------------------------------------- stage independence
+#
+# run_symbols referenced `dir`, which is local to run_qemu. CI invokes the stages as separate
+# script runs, so SYMBOL VERIFY died with "dir: unbound variable" -- after QEMU had built
+# correctly. Every run_* stage must be independently executable, and this is the test for that
+# class rather than for the one instance.
+
+# Extract run_symbols' body structurally: it ends at the first line that does not start with
+# whitespace. A textual end anchor was tried first and matched nothing, which quietly turned the
+# assertions below into tests of an empty string.
+symbols_body() {
+    awk '/^run_symbols\(\) \{/ { inside = 1; print; next }
+         inside && /^[^ \t]/ { inside = 0 }
+         inside { print }' "$ROOT/scripts/build_engine_ios.sh"
+}
+
+# The extractor must yield something, or the two assertions that use it pass vacuously.
+if [ -n "$(symbols_body)" ]; then
+    check 0 "run_symbols body is extractable"
+else
+    check 1 "run_symbols body is extractable"
+fi
+
+STAGE_BODY="$WORK/stages.txt"
+# One line per stage function, so a leak is attributed to the function that has it.
+awk '/^run_[a-z]+\(\) \{/{fn=$0; next} /^}/{fn=""} fn != "" && fn !~ /run_qemu/ && $0 ~ /\$dir([^a-zA-Z_]|$)/ {print fn": "$0}' \
+    "$ROOT/scripts/build_engine_ios.sh" > "$STAGE_BODY"
+if [ -s "$STAGE_BODY" ]; then
+    echo "  FAIL a stage references the run_qemu-local \$dir:" >&2
+    sed 's/^/       /' "$STAGE_BODY" >&2
+    fail=$((fail + 1))
+else
+    check 0 "no stage references the run_qemu-local \$dir"
+fi
+
+# SYMBOL VERIFY must derive the QEMU build directory itself rather than inherit one.
+if [ "$(symbols_body | grep -c 'local qemu_build_dir=')" -gt 0 ]; then
+    check 0 "SYMBOL VERIFY derives the QEMU build directory itself"
+else
+    check 1 "SYMBOL VERIFY derives the QEMU build directory itself"
+fi
+
+# ...and it must actually be handed to the engine-symbol checker, or the object check is skipped.
+if [ "$(symbols_body | grep -c '"\$qemu_build_dir"')" -gt 0 ]; then
+    check 0 "the engine-symbol checker still receives the QEMU build directory"
+else
+    check 1 "the engine-symbol checker still receives the QEMU build directory"
+fi
+
+# The object check must glob, because Meson prefixes the object with its source directory:
+# libcommon.a.p/droidvm_droidvm_qemu_runtime.c.o
+if grep -q "name '\*droidvm_qemu_runtime.c.o'" "$ROOT/scripts/check_engine_symbols.sh"; then
+    check 0 "the runtime object is matched by suffix glob, not a bare filename"
+else
+    check 1 "the runtime object is matched by suffix glob, not a bare filename"
+fi
+# Prove the glob is right by exercising it against the name CI actually produced.
+OBJDIR="$WORK/objname/libcommon.a.p"
+mkdir -p "$OBJDIR"
+: > "$OBJDIR/droidvm_droidvm_qemu_runtime.c.o"
+if [ -n "$(find "$WORK/objname" -name '*droidvm_qemu_runtime.c.o' 2>/dev/null)" ]; then
+    check 0 "the glob finds Meson's directory-prefixed object name"
+else
+    check 1 "the glob finds Meson's directory-prefixed object name"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "  integration regression: PASS ($pass checks)"
