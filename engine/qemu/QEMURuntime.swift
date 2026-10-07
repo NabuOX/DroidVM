@@ -91,13 +91,9 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
                 technical: "prepare() called twice on the same runtime"))
         }
 
-        // THE canonical production location, and the one scripts/package_ipa.sh writes to:
-        // DroidVM.app/Frameworks. `path(forResource:ofType:)` searches the bundle's RESOURCE
-        // directory, which is not where an embedded library lives, so Frameworks is resolved
-        // explicitly rather than inferred.
         let libraryFile = "\(Self.libraryName).dylib"
-        // Frameworks first: that is where scripts/package_ipa.sh puts it. The resource lookup is a
-        // narrow fallback for the host harness, which has no app bundle.
+        // Frameworks is the canonical location scripts/package_ipa.sh writes to. The resource
+        // lookup is a narrow fallback for the host harness, which has no app bundle.
         let candidates = [
             Bundle.main.privateFrameworksURL?.appendingPathComponent(libraryFile),
             Bundle.main.url(forResource: Self.libraryName, withExtension: "dylib"),

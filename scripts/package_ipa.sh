@@ -189,7 +189,6 @@ else
     echo "  -- dependencies --"
     # Process substitution, NOT a pipe: a pipeline would run this loop in a subshell and discard the
     # failure flag, leaving a check that can never fail packaging.
-    dep_fail=0
     while read -r dep; do
         case "$dep" in
             /usr/lib/*|/System/Library/*) printf "  ok       %-28s %s\n" "system" "$dep" ;;
@@ -199,11 +198,10 @@ else
                     printf "  ok       %-28s %s\n" "in bundle" "$base"
                 else
                     echo "  MISSING  dependency '$dep' is not a system library and is not in the bundle" >&2
-                    dep_fail=1
+                    rc=1
                 fi ;;
         esac
     done < <(otool -L "$QEMU_LIB" | tail -n +2 | awk '{print $1}')
-    [ "$dep_fail" -eq 0 ] || rc=1
 fi
 
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
