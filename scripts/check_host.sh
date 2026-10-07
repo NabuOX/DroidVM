@@ -152,6 +152,37 @@ else
 fi
 echo
 
+# ---------------------------------------------------------------- shell syntax
+#
+# Every tracked shell script must PARSE. This exists because a missing quote in
+# scripts/build_engine_ios.sh reached CI and failed gate 3 with a Bash syntax error.
+#
+# That file cannot be RUN on the host -- it needs Xcode -- so no host stage executes it, and
+# nothing noticed that it did not parse. `bash -n` needs no toolchain and would have caught it in
+# milliseconds. A script nothing runs is exactly the script that rots.
+
+echo "--- shell syntax ---"
+syntax_fails=0
+syntax_checked=0
+for script in "$ROOT"/scripts/*.sh; do
+    syntax_checked=$((syntax_checked + 1))
+    if bash -n "$script" 2>/dev/null; then
+        continue
+    fi
+    printf '  FAIL %s does not parse\n' "${script#$ROOT/}" >&2
+    bash -n "$script" 2>&1 | head -5 | sed 's/^/       /' >&2
+    syntax_fails=$((syntax_fails + 1))
+done
+if [ "$syntax_checked" -eq 0 ]; then
+    echo "  FAIL no scripts were found to check" >&2
+    stage_fail "shell syntax (nothing checked)"
+elif [ "$syntax_fails" -eq 0 ]; then
+    echo "  ok   all $syntax_checked scripts parse"
+else
+    stage_fail "shell syntax ($syntax_fails of $syntax_checked script(s) do not parse)"
+fi
+echo
+
 # ---------------------------------------------------------------- integration regression
 #
 # The build integration was previously verified by hand, once. These run it against a fixture

@@ -316,6 +316,21 @@ else
     check 1 "the QEMU stamp is guarded by a stored fingerprint"
 fi
 
+# HOST CHECK must syntax-check the build script. It cannot be RUN on the host, so without
+# `bash -n` nothing on the host executes or parses it -- which is how an unterminated string in it
+# reached CI and failed gate 3.
+if grep -q 'bash -n' "$ROOT/scripts/check_host.sh"; then
+    check 0 "HOST CHECK syntax-checks the shell scripts"
+else
+    check 1 "HOST CHECK syntax-checks the shell scripts"
+fi
+# And this script must actually parse, which the assertion above does not prove by itself.
+if bash -n "$ROOT/scripts/build_engine_ios.sh" 2>/dev/null; then
+    check 0 "build_engine_ios.sh parses"
+else
+    check 1 "build_engine_ios.sh parses"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "  integration regression: PASS ($pass checks)"

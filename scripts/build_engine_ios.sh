@@ -509,7 +509,7 @@ run_qemu() {
     # cache would skip the integration entirely and the build would report on an engine that never
     # contained it.
     "$ROOT/scripts/integrate_engine.sh" "$SRC/$QEMU_SRC_NAME" \
-        || die "engine integration failed; see the output above
+        || die "engine integration failed; see the output above"
     local dir="$SRC/$QEMU_SRC_NAME"
     local log="$LOGS/qemu.log"
 
