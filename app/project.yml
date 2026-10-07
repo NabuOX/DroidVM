@@ -24,6 +24,21 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
   generateEmptyDirectories: true
+  # XcodeGen's `projectFormat` DEFAULT IS `xcode16_0`, which writes objectVersion 77. Xcode
+  # 15.4 -- DroidVM's CI baseline -- refuses to open that at all:
+  #
+  #   The project 'DroidVM' cannot be opened because it is in a future Xcode project file
+  #   format (77).
+  #
+  # That failed gate 3's APP LINK layer while all five earlier layers passed. The format is
+  # therefore stated explicitly instead of inherited, so the generated project is a function
+  # of this file rather than of whichever XcodeGen version the runner happens to install.
+  #
+  # `xcode15_3` is the newest Xcode 15 project format and is readable by Xcode 15.4. Raising
+  # the CI baseline means raising this deliberately; scripts/check_repo.py rejects a missing
+  # or too-new format rather than trusting the default.
+  xcodeVersion: "15.4"
+  projectFormat: xcode15_3
 
 settings:
   base:

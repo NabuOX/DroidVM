@@ -317,6 +317,48 @@ def check_identity_values():
         ok("identity: bundle identifier %s" % ident)
 
 
+# Project formats DroidVM's CI baseline (Xcode 15.4) can open. Listed rather than derived,
+# because "is this format too new" is exactly the judgement the default got wrong.
+XCODE_15_PROJECT_FORMATS = ("xcode15_3", "xcode15_0")
+
+
+def check_project_format():
+    """app/project.yml must pin a project format our Xcode can actually open.
+
+    XcodeGen defaults `projectFormat` to `xcode16_0`, which writes objectVersion 77. Relying on
+    that default failed gate 3's APP LINK layer with "the project cannot be opened because it
+    is in a future Xcode project file format (77)" -- after all five earlier layers had passed,
+    so a green build looked like an app-link bug.
+
+    Pinning it makes the generated project a function of this file rather than of whichever
+    XcodeGen version the runner installs.
+    """
+    path = os.path.join(ROOT, "app/project.yml")
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+
+    match = re.search(r"^\s*projectFormat:\s*[\"']?([A-Za-z0-9_]+)", text, re.MULTILINE)
+    if not match:
+        fail("app/project.yml does not pin projectFormat, so XcodeGen's default (xcode16_0, "
+             "objectVersion 77) is used and Xcode 15.4 cannot open the project")
+        return
+
+    fmt = match.group(1)
+    if fmt not in XCODE_15_PROJECT_FORMATS:
+        fail("app/project.yml pins projectFormat %r, which is newer than the CI baseline "
+             "(Xcode 15.4). Allowed: %s"
+             % (fmt, ", ".join(XCODE_15_PROJECT_FORMATS)))
+        return
+
+    if not re.search(r"^\s*xcodeVersion:\s*[\"']?\d", text, re.MULTILINE):
+        fail("app/project.yml sets projectFormat but not xcodeVersion")
+        return
+
+    ok("project format: %s, for Xcode 15.4" % fmt)
+
+
 # ------------------------------------------------------------------- main
 
 # ------------------------------------------------------------------- modes
@@ -385,6 +427,7 @@ def main():
     check_identity_values()
     check_script_modes()
     check_symbol_manifest()
+    check_project_format()
 
     for note in notes:
         print("  ok   %s" % note)
