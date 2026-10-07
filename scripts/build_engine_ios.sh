@@ -66,8 +66,64 @@ if ! command -v xcrun >/dev/null 2>&1; then
     exit 2
 fi
 
-die() { echo "  FAIL: $*" >&2; exit 1; }
+die() {
+    echo "  FAIL: $*" >&2
+    # A GitHub Actions annotation, because without one the diagnosis is unreachable: job logs
+    # require a token, and the annotations API is the only surface an unauthenticated reader
+    # can see. Three gate-3 runs were spent on "Process completed with exit code 1".
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '::error title=engine build::%s\n' \
+            "$(printf '%s' "$*" | sed 's/%/%25/g' | tr '\n' ' ' | tr -d '\r')"
+    fi
+    exit 1
+}
+
 banner() { printf '\n=== %s ===\n' "$*"; }
+
+# QEMU refuses to compile when NDEBUG is defined, and the message is unambiguous:
+#
+#   include/qemu/osdep.h:294: #error building with NDEBUG is not supported
+#
+# NDEBUG is not an optimisation flag -- it disables `assert()`, and QEMU relies on its
+# assertions for correctness. So removing it keeps `-O2` intact and makes the engine stricter
+# rather than weaker.
+#
+# Declared as a function rather than inline for one reason: a guard that cannot be run
+# anywhere is a guard nobody has tested. This script exits 2 on any host without Xcode, so the
+# guard is unreachable there -- but as a function it can be extracted and called, and
+# scripts/check_host.sh does exactly that, proving it accepts a clean -O2 flag set and refuses
+# one containing NDEBUG.
+require_no_ndebug() {
+    local droidvm_flags
+    for droidvm_flags in "$@"; do
+        case "$droidvm_flags" in
+            *-DNDEBUG*)
+                die "DroidVM's compile flags define NDEBUG, which QEMU refuses to build with (include/qemu/osdep.h:294). Remove it from CFLAGS; -O2 is the optimisation."
+                ;;
+        esac
+    done
+}
+
+# Fail with the log surfaced. The FIRST decisive line is what matters -- it is the actual
+# compiler or configure error, and hiding it behind a path is what made the last failure take
+# a run to identify.
+die_log() {
+    local stage="$1" log="$2" msg="$3" decisive=""
+    if [ -f "$log" ]; then
+        decisive="$(grep -m1 -E '#error|error:|Error:|ERROR:|configure: error' "$log" \
+                    || tail -n 1 "$log")"
+        echo "----- $stage log tail ($log) -----" >&2
+        tail -n 40 "$log" >&2
+        echo "---------------------------------" >&2
+    else
+        decisive="$msg (no log at $log)"
+    fi
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '::error title=%s::%s\n' "$stage" \
+            "$(printf '%s' "$decisive" | sed 's/%/%25/g' | tr '\n' ' ' | tr -d '\r')"
+    fi
+    die "$msg"
+}
 
 # Fail hard on a missing tool rather than half-way through a dependency's configure.
 for tool in curl make patch pkg-config git; do
@@ -90,11 +146,25 @@ RANLIB="$(xcrun --sdk iphoneos --find ranlib)"
 STRIP="$(xcrun --sdk iphoneos --find strip)"
 PKG_CONFIG="$(command -v pkg-config)"
 
-CFLAGS="-target $TARGET -isysroot $SDK -O2 -fPIC -DNDEBUG"
+# -O2 stays. -DNDEBUG does not, and the reason is worth recording because it cost a
+# multi-hour CI run to find.
+#
+# QEMU REFUSES TO BUILD WITH NDEBUG:
+#
+#   include/qemu/osdep.h:294: #error building with NDEBUG is not supported
+#
+# And NDEBUG is not an optimisation flag to begin with -- it disables `assert()`. QEMU relies
+# on its assertions for correctness, so defining it there is a correctness change that QEMU
+# forbids outright. Dropping it keeps `-O2`, and if anything it makes the engine stricter
+# rather than weaker. The guard below is not ceremony: the flag used to be here, and nothing
+# in the script said why it could not be.
+CFLAGS="-target $TARGET -isysroot $SDK -O2 -fPIC"
 CXXFLAGS="$CFLAGS -std=c++17"
 OBJCFLAGS="$CFLAGS"
 LDFLAGS="-target $TARGET -isysroot $SDK"
 export CFLAGS CXXFLAGS OBJCFLAGS LDFLAGS CC CXX AR NM RANLIB STRIP
+
+require_no_ndebug "$CFLAGS" "$CXXFLAGS" "$OBJCFLAGS"
 
 # pkg-config must look ONLY inside the sysroot. Left to itself it finds Homebrew's macOS
 # libraries, and the link then fails with "building for iOS, but linking in dylib built for
@@ -235,7 +305,7 @@ build_autotools() {
       && ./configure --host=aarch64-apple-darwin --prefix="$PREFIX" \
                      --enable-static --disable-shared "$@" \
       && make -j"$NCPU" \
-      && make install ) > "$log" 2>&1 || die "$name failed; see $log"
+      && make install ) > "$log" 2>&1 || die_log "$name" "$log" "$name failed to build"
     mark_stage "$name"
 }
 
@@ -249,7 +319,8 @@ build_meson() {
       && meson setup _droidvm_build --cross-file "$cross" --prefix="$PREFIX" \
                 --buildtype=release --default-library=static "$@" \
       && meson compile -C _droidvm_build -j "$NCPU" \
-      && meson install -C _droidvm_build ) > "$log" 2>&1 || die "$name failed; see $log"
+      && meson install -C _droidvm_build ) > "$log" 2>&1 \
+        || die_log "$name" "$log" "$name failed to build"
     mark_stage "$name"
 }
 
@@ -310,10 +381,36 @@ run_deps() {
     apply_patch libslirp-v4.9.1 libslirp-v4.9.1.patch
     build_meson libslirp-v4.9.1 "$CROSS_DARWIN"
 
-    echo
-    echo "  DEPENDENCIES: PASS"
-    ls -1 "$PREFIX/lib"/*.a 2>/dev/null | sed 's/^/    /' \
-        || die "no static libraries were installed into $PREFIX/lib"
+    # THE GUARD THAT COULD NOT FAIL.
+    #
+    # This used to be:
+    #
+    #     ls -1 "$PREFIX/lib"/*.a 2>/dev/null | sed 's/^/    /' || die "no static libraries..."
+    #
+    # `|| die` binds to the PIPELINE's status, which is sed's -- and sed succeeds even when ls
+    # finds nothing. So the stage would have reported PASS with an empty sysroot. It is written
+    # out here so that nobody restores the one-liner.
+    local installed
+    installed="$(ls -1 "$PREFIX/lib"/*.a 2>/dev/null || true)"
+    if [ -z "$installed" ]; then
+        die "no static libraries were installed into $PREFIX/lib"
+    fi
+
+    # And each required library by name, because a non-empty directory is not the same claim as
+    # "the five dependencies produced what QEMU will look for".
+    local required missing=0
+    for required in libglib-2.0.a libgobject-2.0.a libgio-2.0.a \
+                    libffi.a libpixman-1.a libslirp.a libucontext.a; do
+        if [ -f "$PREFIX/lib/$required" ]; then
+            printf '  %-32s present\n' "$required"
+        else
+            printf '  %-32s MISSING\n' "$required" >&2
+            missing=$((missing + 1))
+        fi
+    done
+    [ "$missing" -eq 0 ] || die "$missing required library/libraries are missing from $PREFIX/lib"
+
+    echo "  DEPENDENCIES: PASS ($(echo "$installed" | wc -l | tr -d ' ') static libraries)"
 }
 
 # ---------------------------------------------------------------- NATIVE ENGINE
@@ -397,7 +494,8 @@ run_qemu() {
                 --disable-nettle --disable-gcrypt --disable-auth-pam \
                 --disable-install-blobs --disable-sparse --disable-debug-info \
                 --extra-cflags="$CFLAGS" --extra-ldflags="$LDFLAGS" \
-          && make -j"$NCPU" ) > "$log" 2>&1 || die "QEMU failed; see $log"
+          && make -j"$NCPU" ) > "$log" 2>&1 \
+            || die_log "QEMU" "$log" "QEMU configure or build failed"
         mark_stage qemu
     fi
 
@@ -531,7 +629,7 @@ run_app() {
     rc=$?
     set -e
     grep -E "error:|BUILD (SUCCEEDED|FAILED)" "$log" | tail -20 || true
-    [ "$rc" -eq 0 ] || die "the app did not link; see $log"
+    [ "$rc" -eq 0 ] || die_log "APP LINK" "$log" "the app did not link"
 
     local app="$BUILD/derived/Build/Products/Release-iphoneos/DroidVM.app"
     [ -d "$app" ] || die "no app bundle at $app"

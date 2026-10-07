@@ -152,6 +152,43 @@ else
 fi
 echo
 
+# ---------------------------------------------------------------- guard tests
+#
+# Guards that cannot fail are not guards. Two of them live in shell scripts that cannot run on
+# this host -- build_engine_ios.sh exits 2 without Xcode -- so their logic is extracted and
+# exercised here instead. This is how the dependency false-pass and the NDEBUG regression were
+# caught, and it is how they stay caught.
+
+echo "--- guard self-tests ---"
+
+# require_no_ndebug: must accept a clean release flag set and refuse one containing NDEBUG.
+# QEMU hard-errors on it (include/qemu/osdep.h:294) and that cost a multi-hour CI run.
+GUARD_BODY="$(mktemp)"
+sed -n '/^require_no_ndebug() {/,/^}/p' "$ROOT/scripts/build_engine_ios.sh" > "$GUARD_BODY"
+if [ ! -s "$GUARD_BODY" ]; then
+    echo "  FAIL: could not extract require_no_ndebug from build_engine_ios.sh" >&2
+    stage_fail "require_no_ndebug extraction"
+else
+    run_guard() {
+        { echo 'die() { exit 1; }'; cat "$GUARD_BODY"; printf 'require_no_ndebug %s\n' "$1"; } \
+            | bash >/dev/null 2>&1
+    }
+    if run_guard '"-O2 -fPIC"'; then
+        echo "  ok   require_no_ndebug accepts a clean -O2 flag set"
+    else
+        echo "  FAIL require_no_ndebug refused a clean -O2 flag set" >&2
+        stage_fail "require_no_ndebug false positive"
+    fi
+    if run_guard '"-O2" "-O2 -std=c++17" "-O2 -DNDEBUG"'; then
+        echo "  FAIL require_no_ndebug accepted NDEBUG (QEMU refuses to build with it)" >&2
+        stage_fail "require_no_ndebug did not fire"
+    else
+        echo "  ok   require_no_ndebug refuses NDEBUG, in any argument"
+    fi
+fi
+rm -f "$GUARD_BODY"
+echo
+
 echo "================================================================"
 if [ "$fails" -eq 0 ]; then
     echo " HOST CHECK: PASS"
