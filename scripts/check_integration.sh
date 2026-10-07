@@ -189,6 +189,133 @@ else
     check 1 "engine-symbol check passes when the runtime object is present"
 fi
 
+# ---------------------------------------------------------------- manifest union (the four false alarms)
+#
+# Gate 3 failed with "DECLARED IN BRIDGE, ABSENT FROM MANIFEST" for the four runtime symbols,
+# because declaration coverage consulted only the app manifest. The fix is the union of both.
+UNION_BODY="$WORK/union.body"
+sed -n '/^declaration_is_covered() {/,/^}/p' "$ROOT/scripts/build_engine_ios.sh" > "$UNION_BODY"
+if [ ! -s "$UNION_BODY" ]; then
+    check 1 "declaration_is_covered is extractable"
+else
+    check 0 "declaration_is_covered is extractable"
+    covered() {
+        { cat "$UNION_BODY"; printf 'declaration_is_covered "%s" "%s"\n' "$ROOT" "$1"; } | bash
+    }
+
+    # App-owned: in required-symbols.txt only.
+    covered droidvm_jit_probe \
+        && check 0 "app-manifest symbol is covered" \
+        || check 1 "app-manifest symbol is covered"
+
+    # Engine-owned: the four that failed in CI.
+    for s in droidvm_runtime_state_get droidvm_runtime_is_running \
+             droidvm_runtime_last_reason droidvm_runtime_note_initialized; do
+        covered "$s" \
+            && check 0 "engine-manifest symbol is covered: $s" \
+            || check 1 "engine-manifest symbol is covered: $s"
+    done
+
+    # A declaration in NEITHER manifest must still fail coverage, or the union would have turned a
+    # real gate into a rubber stamp.
+    covered droidvm_runtime_not_a_real_symbol \
+        && check 1 "a symbol in neither manifest is NOT covered" \
+        || check 0 "a symbol in neither manifest is NOT covered"
+
+    # The union must not have leaked engine symbols into the app manifest.
+    if grep -q "^droidvm_runtime_is_running$" "$ROOT/engine/symbols/required-symbols.txt"; then
+        check 1 "engine-owned symbols were NOT copied into the app manifest"
+    else
+        check 0 "engine-owned symbols were NOT copied into the app manifest"
+    fi
+fi
+
+# ---------------------------------------------------------------- QEMU cache invalidation
+#
+# Gate 3 skipped QEMU on a stamp restored from CI's cache, so an engine built BEFORE D.1a survived
+# into SYMBOL VERIFY and the gate reported on an engine that did not contain the integration.
+FP_BODY="$WORK/fingerprint.body"
+sed -n '/^qemu_integration_fingerprint() {/,/^}/p' "$ROOT/scripts/build_engine_ios.sh" > "$FP_BODY"
+if [ ! -s "$FP_BODY" ]; then
+    check 1 "qemu_integration_fingerprint is extractable"
+else
+    check 0 "qemu_integration_fingerprint is extractable"
+
+    FP="$WORK/fprepo"
+    mkdir -p "$FP"
+    cp -R "$ROOT/scripts" "$FP/scripts"
+    cp -R "$ROOT/engine"  "$FP/engine"
+
+    fp() {
+        { cat "$FP_BODY"; printf 'qemu_integration_fingerprint "%s"\n' "$FP"; } | bash
+    }
+
+    base="$(fp)"
+    [ -n "$base" ] || check 1 "the fingerprint is non-empty"
+    # 1. identical inputs reuse the stamp.
+    if [ "$base" = "$(fp)" ]; then
+        check 0 "identical inputs produce an identical fingerprint (stamp reusable)"
+    else
+        check 1 "identical inputs produce an identical fingerprint (stamp reusable)"
+    fi
+
+    # 2-6. every integration input invalidates it.
+    for rel in "engine/qemu-native/droidvm_qemu_runtime.c" \
+               "engine/qemu-native/droidvm_qemu_runtime.h" \
+               "engine/patches/droidvm-qemu-main-loop.patch" \
+               "engine/qemu-native/meson.build" \
+               "scripts/integrate_engine.sh"; do
+        saved="$WORK/fp.saved"
+        cp "$FP/$rel" "$saved"
+        printf '\n/* regression probe */\n' >> "$FP/$rel"
+        changed="$(fp)"
+        if [ "$changed" != "$base" ]; then
+            check 0 "changing $rel invalidates the QEMU stamp"
+        else
+            check 1 "changing $rel invalidates the QEMU stamp"
+        fi
+        cp "$saved" "$FP/$rel"
+    done
+
+    # The engine symbol manifest is an input too: adding a required export changes the build.
+    saved="$WORK/fp.saved"
+    cp "$FP/engine/symbols/required-engine-symbols.txt" "$saved"
+    printf '\ndroidvm_probe_symbol\n' >> "$FP/engine/symbols/required-engine-symbols.txt"
+    if [ "$(fp)" != "$base" ]; then
+        check 0 "changing required-engine-symbols.txt invalidates the QEMU stamp"
+    else
+        check 1 "changing required-engine-symbols.txt invalidates the QEMU stamp"
+    fi
+    cp "$saved" "$FP/engine/symbols/required-engine-symbols.txt"
+
+    # QEMU source identity is part of it: a different engine is a different build.
+    other="$({ cat "$FP_BODY"; printf 'qemu_integration_fingerprint "%s" "qemu-different"\n' "$FP"; } | bash)"
+    if [ "$other" != "$base" ]; then
+        check 0 "a different QEMU source identity invalidates the QEMU stamp"
+    else
+        check 1 "a different QEMU source identity invalidates the QEMU stamp"
+    fi
+
+    # And a changed file must RESTORE to the same fingerprint, or the check would be one-way.
+    if [ "$(fp)" = "$base" ]; then
+        check 0 "restoring the inputs restores the fingerprint"
+    else
+        check 1 "restoring the inputs restores the fingerprint"
+    fi
+fi
+
+# The integration must be invoked BEFORE the stamp decision, or a cached stamp skips it entirely.
+if grep -q 'integrate_engine.sh" "\$SRC/\$QEMU_SRC_NAME"' "$ROOT/scripts/build_engine_ios.sh"; then
+    check 0 "integrate_engine.sh is invoked by the engine build"
+else
+    check 1 "integrate_engine.sh is invoked by the engine build"
+fi
+if grep -q 'STAMPS/qemu.fingerprint' "$ROOT/scripts/build_engine_ios.sh"; then
+    check 0 "the QEMU stamp is guarded by a stored fingerprint"
+else
+    check 1 "the QEMU stamp is guarded by a stored fingerprint"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "  integration regression: PASS ($pass checks)"

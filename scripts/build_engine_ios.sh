@@ -443,6 +443,56 @@ run_native() {
 # the machine has to live inside this one. That is what `--enable-shared-lib` is for, and it
 # is why the export list matters -- QEMU exports only what `system/qemu.symbols` names.
 
+# A fingerprint over every input that materially affects the produced engine.
+#
+# WHY THIS EXISTS
+#
+# Gate 3 skipped QEMU on a stamp restored from CI's engine cache:
+#
+#     [skip] configure and make (stamped)
+#
+# The stamp came from a build made BEFORE D.1a, so an old dylib survived into SYMBOL VERIFY and the
+# gate reported on an engine that did not contain the integration it was meant to prove. A stamp
+# proves only that something was built once; it says nothing about what.
+#
+# So the stamp is reusable only when this fingerprint MATCHES the stored one. It covers the
+# integration sources, the patch, the engine symbol manifest, the QEMU source identity, and the
+# configure options that shape the produced library.
+#
+# Self-contained and taking the repository root, so scripts/check_integration.sh can extract it and
+# prove each input invalidates the stamp. This rule IS the defect being fixed, so it is tested
+# rather than trusted.
+qemu_integration_fingerprint() {
+    local repo_root="$1"
+    local qemu_source="${2:-qemu-10.0.12-utm}"
+
+    local inputs=(
+        "scripts/integrate_engine.sh"
+        "engine/qemu-native/droidvm_qemu_runtime.c"
+        "engine/qemu-native/droidvm_qemu_runtime.h"
+        "engine/qemu-native/meson.build"
+        "engine/patches/droidvm-qemu-main-loop.patch"
+        "engine/symbols/required-engine-symbols.txt"
+    )
+
+    {
+        printf 'qemu-source: %s\n' "$qemu_source"
+        printf 'target-list: aarch64-softmmu\n'
+        printf 'shared-lib: yes\n'
+        printf 'coroutine: libucontext\n'
+        printf 'slirp: yes\n'
+        printf 'opengl: no\n'
+        printf 'virglrenderer: no\n'
+        printf 'fingerprint-version: 1\n'
+
+        local rel
+        for rel in "${inputs[@]}"; do
+            printf -- '--- %s\n' "$rel"
+            cat "$repo_root/$rel" 2>/dev/null || printf 'MISSING\n'
+        done
+    } | shasum -a 256 | awk '{print $1}'
+}
+
 run_qemu() {
     banner "QEMU ($QEMU_SRC_NAME)"
     fetch "qemu-10.0.12-utm.tar.xz" \
@@ -450,29 +500,35 @@ run_qemu() {
           "$VENDOR/qemu-10.0.12-utm.tar.xz"
     extract "$VENDOR/qemu-10.0.12-utm.tar.xz" "$QEMU_SRC_NAME"
 
-    # NOTE on placement, because it is the one thing about this stage that is deliberately
-    # incomplete.
+    # The integration runs BEFORE the stamp is consulted, on every invocation. It is cheap and
+    # idempotent, and it is the step that copies DroidVM's module into QEMU's tree, applies the
+    # main-loop patch and wires Meson.
     #
-    # DroidVM's bridge currently compiles into the APP target (stage `native`), and the dylib
-    # provides QEMU's entry points. That is coherent for a link gate: the app dlopens the
-    # dylib and resolves qemu_* from it.
-    #
-    # It is NOT yet coherent at runtime, and the gap is worth naming. The display listener has
-    # to live INSIDE QEMU -- it is QEMU's DisplayChangeListener, registered with QEMU's display
-    # system, and QEMU's callbacks call the six counters. Those counters therefore have to be
-    # in the same image as the listener. Moving the bridge into the dylib means the Swift
-    # adapters resolve droidvm_* through dlsym exactly as they resolve qemu_*, which is a real
-    # change to TrapExecutableMemory and MetalDisplaySurface and belongs to the phase that
-    # makes the machine run.
-    #
-    # Copying the bridge into QEMU's tree now would give the process TWO sets of counters --
-    # one in the app, one in the dylib -- and the app would read the wrong one. So
-    # integrate_engine.sh is not called here, and scripts/integrate_engine.sh says why.
+    # Order matters and was wrong before. The stamp decides whether to rebuild, so anything that
+    # changes what would be built has to be applied first -- otherwise a stamp restored from CI's
+    # cache would skip the integration entirely and the build would report on an engine that never
+    # contained it.
+    "$ROOT/scripts/integrate_engine.sh" "$SRC/$QEMU_SRC_NAME" \
+        || die "engine integration failed; see the output above
     local dir="$SRC/$QEMU_SRC_NAME"
     local log="$LOGS/qemu.log"
-    if done_stage qemu; then
-        echo "  [skip] configure and make (stamped)"
+
+    # A stamp is NOT evidence that the engine is current. It travels with the cache, so a cached
+    # build from before this integration would otherwise be reported on as though it contained it.
+    local fingerprint stored=""
+    fingerprint="$(qemu_integration_fingerprint "$ROOT" "$QEMU_SRC_NAME")"
+    [ -f "$STAMPS/qemu.fingerprint" ] && stored="$(cat "$STAMPS/qemu.fingerprint")"
+
+    if done_stage qemu && [ "$stored" = "$fingerprint" ]; then
+        echo "  [skip] configure and make (stamp and integration fingerprint match)"
+        echo "         fingerprint ${fingerprint:0:12}"
     else
+        if done_stage qemu; then
+            echo "  integration inputs changed; invalidating the cached engine build"
+            echo "    cached  fingerprint: ${stored:-<none>}"
+            echo "    current fingerprint: ${fingerprint:0:12}"
+            rm -f "$STAMPS/qemu"
+        fi
         echo "  configuring (this is the long one)"
         rm -rf "$dir/_droidvm_build"; mkdir -p "$dir/_droidvm_build"
         ( cd "$dir/_droidvm_build" \
@@ -497,6 +553,7 @@ run_qemu() {
           && make -j"$NCPU" ) > "$log" 2>&1 \
             || die_log "QEMU" "$log" "QEMU configure or build failed"
         mark_stage qemu
+        printf '%s\n' "$fingerprint" > "$STAMPS/qemu.fingerprint"
     fi
 
     local built="$dir/_droidvm_build/libqemu-aarch64-softmmu.dylib"
@@ -529,6 +586,26 @@ run_qemu() {
 # exits 2 without Xcode. scripts/check_host.sh extracts it and proves a declaration is matched,
 # a comment-only mention is rejected, and an input yielding nothing is refused rather than
 # accepted.
+# Whether a bridge declaration is covered by one of the TWO manifests.
+#
+# DroidVM has two images and therefore two manifests: `required-symbols.txt` lists what the APP's
+# objects must define, and `required-engine-symbols.txt` lists what the finished QEMU dylib must
+# export. A declaration in the public header is gated by whichever applies.
+#
+# Checking only the first manifest failed Gate 3 with four false alarms, because the runtime
+# confirmation symbols are correctly engine-owned. The fix is the union -- NOT copying them into the
+# app manifest, which would put them back into a gate that must never see them.
+declaration_is_covered() {
+    local repo_root="$1"
+    local symbol="$2"
+
+    grep -qE "^[[:space:]]*${symbol}[[:space:]]*$" \
+        "$repo_root/engine/symbols/required-symbols.txt" 2>/dev/null && return 0
+    grep -qE "^[[:space:]]*${symbol}[[:space:]]*$" \
+        "$repo_root/engine/symbols/required-engine-symbols.txt" 2>/dev/null && return 0
+    return 1
+}
+
 extract_bridge_declarations() {
     local header="$1"
     [ -f "$header" ] || die "no bridge header at $header"
@@ -634,12 +711,12 @@ run_symbols() {
     header_symbols="$(extract_bridge_declarations engine/include/DroidVMBridge.h)"
     echo "  bridge header declares $(printf '%s\n' "$header_symbols" | wc -l | tr -d ' ') symbol(s)"
     for exported in $header_symbols; do
-        if ! grep -qE "^[[:space:]]*${exported}[[:space:]]*$" "$MANIFEST"; then
-            printf '  %-46s DECLARED IN BRIDGE, ABSENT FROM MANIFEST\n' "$exported" >&2
+        if ! declaration_is_covered "$ROOT" "$exported"; then
+            printf '  %-46s DECLARED IN BRIDGE, IN NEITHER MANIFEST\n' "$exported" >&2
             undeclared=$((undeclared + 1))
         fi
     done
-    [ "$undeclared" -eq 0 ] || die "$undeclared bridge declaration(s) are not in the manifest"
+    [ "$undeclared" -eq 0 ] || die "$undeclared bridge declaration(s) are in neither manifest"
 
     # Three short statements, deliberately. This used to be one echo split across two lines
     # with no continuation: the second line began with a quote, so the shell read it as a
