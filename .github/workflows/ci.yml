@@ -123,11 +123,34 @@ jobs:
       - name: build tools
         run: brew install xcodegen meson ninja pkg-config || true
 
-      - name: build the engine for iOS
-        run: ./scripts/build_engine_ios.sh
+      # The SAME cache key gate 3 uses, so a dispatch reuses the engine that was already verified
+      # for these integration inputs instead of rebuilding QEMU from source.
+      - name: restore engine cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/ios-arm64/sysroot
+            build/ios-arm64/stamps
+            engine/vendor
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/include/DroidVMBridge.h', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
 
-      - name: package the unsigned IPA
-        run: ./scripts/package_ipa.sh
+      - name: build the engine for iOS
+        run: ./scripts/build_engine_ios.sh deps native qemu
+
+      - name: save engine cache after a successful QEMU build
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/ios-arm64/sysroot
+            build/ios-arm64/stamps
+            engine/vendor
+          key: engine-${{ runner.os }}-${{ hashFiles('engine/patches/**', 'engine/qemu-native/**', 'engine/include/DroidVMBridge.h', 'engine/symbols/required-engine-symbols.txt', 'scripts/integrate_engine.sh', 'scripts/build_engine_ios.sh', 'engine/deps-digests.txt') }}
+
+      - name: 4. SYMBOL VERIFY
+        run: ./scripts/build_engine_ios.sh symbols
+
+      - name: PACKAGE IPA
+        run: DROIDVM_ENGINE_LIB="$PWD/build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib" ./scripts/package_ipa.sh "build/DroidVM-${GITHUB_SHA:0:7}.ipa"
 
       - name: stage result
         run: |
@@ -141,8 +164,8 @@ jobs:
       - name: upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DroidVM-unsigned-ipa
-          path: build/DroidVM.ipa
+          name: DroidVM-${GITHUB_SHA:0:7}-ipa
+          path: build/DroidVM-*.ipa
           if-no-files-found: error
 
       - name: upload stage result
