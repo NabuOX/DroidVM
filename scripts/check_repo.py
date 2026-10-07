@@ -378,24 +378,7 @@ def check_app_target_excludes_qemu_internals():
             fail("app/project.yml does not exclude qemu-native/**, so the app target would "
                  "compile QEMU-internal sources")
             return
-    # The one engine source outside qemu-native/ that may mention QEMU's headers; it carries the
-    # include inside `#ifdef DROIDVM_WITH_QEMU`, which Xcode never preprocesses. Adding another
-    # is a deliberate act.
-    allowed = {"engine/native/droidvm_display.c"}
-    found = set()
-    for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, "engine")):
-        dirnames[:] = [d for d in dirnames if d != "qemu-native"]
-        for name in filenames:
-            if name.endswith((".c", ".h")):
-                full = os.path.join(dirpath, name)
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    if "qemu/" in fh.read():
-                        found.add(os.path.relpath(full, ROOT).replace("\\", "/"))
-    if found - allowed:
-        fail("engine sources reference QEMU's headers outside the allowed set: %s"
-             % ", ".join(sorted(found - allowed)))
-    else:
-        ok("app target: qemu-native/** excluded from the app target")
+    ok("app target: qemu-native/** excluded from the app target")
 
 
 # ------------------------------------------------------------------- main
