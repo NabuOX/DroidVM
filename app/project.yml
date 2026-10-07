@@ -77,6 +77,12 @@ targets:
         excludes:
           - "vendor/**"
           - "include/**"
+          # Docs and build-only metadata. Without this, engine/README.md and
+          # engine/patches/README.md both became DroidVM.app/README.md -- an app bundle has a
+          # flat namespace, so Xcode refused with "Multiple commands produce".
+          - "README.md"
+          - "patches/**"
+          - "symbols/**"
     dependencies:
       - package: DroidVMCore
         product: DroidVMCore
