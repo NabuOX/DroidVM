@@ -88,6 +88,14 @@ final class EngineModel: ObservableObject {
                                                 confirmer: DroidVMRuntimeConfirmation(provider: runtime),
                                                 display: display,
                                                 surface: surface,
+                                                // The engine is the only source of QEMU
+                                                // display facts, so the report reads them
+                                                // from it, not from app-side bookkeeping.
+                                                displayTelemetry: { runtime.displayObservation() },
+                                                // The coordinator's own display result, so the
+                                                // engine's state follows the ONE place attachment
+                                                // is decided.
+                                                noteHostAttachment: { runtime.noteHostDisplayAttachment($0) },
                                                 recorder: recorder)
 
         // Registered after every stored property is initialised, so capturing self weakly is

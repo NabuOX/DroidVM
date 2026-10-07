@@ -228,6 +228,45 @@ public struct EngineRunReport: Equatable, Sendable {
     /// Where the stop happened, and any detail worth keeping. Not shown to a user.
     public var technicalDetail: String?
 
+    /// What the ENGINE's display listener observed, gathered from the QEMU dylib rather than from
+    /// Swift bookkeeping.
+    ///
+    /// GEOMETRY IS OPTIONAL BECAUSE "NO SURFACE YET" IS NOT "A 0x0 SURFACE". A zero reads as a real
+    /// measurement and cannot be told apart from an engine whose guest is drawing nothing, so `nil`
+    /// -- rendered as `-`, encoded as JSON null -- is the honest value until a surface exists.
+    ///
+    /// `state` is the engine's own lifecycle, which keeps `listenerRegistered` and `attached`
+    /// distinguishable: the first says QEMU has a graphic console with our listener on it, the
+    /// second says DroidVM also has somewhere to put a frame. Neither says Android is ready, and
+    /// neither is what makes `displayInit` pass.
+    public struct DisplayObservation: Equatable, Sendable {
+        public var state: DroidVMDisplayState = .notAttempted
+        public var width: Int?
+        public var height: Int?
+        public var stride: Int?
+        public var updates: UInt64 = 0
+        public var surfaceReplacements: UInt64 = 0
+        public var reason: String?
+
+        public init() {}
+
+        /// The report lines, in the report's own `key: value` style.
+        public var renderedLines: [String] {
+            [
+                "display_state: \(state.reportName)",
+                "display_width: \(width.map(String.init) ?? "-")",
+                "display_height: \(height.map(String.init) ?? "-")",
+                "display_stride: \(stride.map(String.init) ?? "-")",
+                "display_updates: \(updates)",
+                "display_surface_replacements: \(surfaceReplacements)",
+                "display_last_reason: \(reason ?? "-")",
+            ]
+        }
+    }
+
+    /// The engine's display telemetry. Populated before the report is rendered and emitted.
+    public var display = DisplayObservation()
+
     public init() {}
 
     /// The whole of Level D's claim, and the only place it is decided.
@@ -266,6 +305,7 @@ public struct EngineRunReport: Equatable, Sendable {
         lines.append("qemu_init: \(qemuInit.rawValue)")
         lines.append("qemu_started: \(qemuStarted.rawValue)")
         lines.append("display_init: \(displayInit.rawValue)")
+        lines.append(contentsOf: display.renderedLines)
         lines.append("crash: \(crashed ? "YES" : "NO")")
         lines.append("failure_reason: \(failureReason ?? "-")")
         lines.append("result: \(result.rawValue)")
@@ -412,6 +452,38 @@ public func confirmRuntime(
 
         if Date().timeIntervalSince(started) >= timeout { return .timedOut }
         try? await Task.sleep(nanoseconds: UInt64(max(0, pollInterval) * 1_000_000_000))
+    }
+}
+
+// MARK: - Native display state (D.1b)
+
+/// The engine's display-listener lifecycle, as the QEMU dylib reports it.
+///
+/// A Swift mirror of the `droidvm_display_state` C enum. The raw values are pinned on the C side by
+/// `_Static_assert`s, so a divergence fails a build rather than silently misreporting.
+///
+/// DELIBERATELY NOT THE FRAME COUNTERS. "QEMU has a graphic console" and "frames are reaching the
+/// screen" are different facts; collapsing them is how a console would start meaning a working
+/// display. Nothing here is "ready".
+public enum DroidVMDisplayState: Int32, Equatable, Sendable, CaseIterable {
+    case notAttempted = 0
+    case listenerRegistered = 1
+    case attached = 2
+    case detached = 3
+    case failed = 4
+
+    /// The stable name used in the device report and the JSON event.
+    ///
+    /// The raw values stay numeric so that mirroring the C enum is a value comparison; this is the
+    /// reader-facing spelling, and readers filter on it, so it is part of the format.
+    public var reportName: String {
+        switch self {
+        case .notAttempted: return "NOT ATTEMPTED"
+        case .listenerRegistered: return "LISTENER REGISTERED"
+        case .attached: return "ATTACHED"
+        case .detached: return "DETACHED"
+        case .failed: return "FAILED"
+        }
     }
 }
 

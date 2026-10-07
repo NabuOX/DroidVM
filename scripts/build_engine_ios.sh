@@ -470,6 +470,7 @@ qemu_integration_fingerprint() {
         "scripts/integrate_engine.sh"
         "engine/qemu-native/droidvm_qemu_runtime.c"
         "engine/qemu-native/droidvm_qemu_runtime.h"
+        "engine/qemu-native/droidvm_qemu_display.c"
         "engine/qemu-native/meson.build"
         "engine/patches/droidvm-qemu-main-loop.patch"
         "engine/symbols/required-engine-symbols.txt"
@@ -790,7 +791,7 @@ run_app() {
 
     local log="$LOGS/app-link.log" rc=0
 
-    # Avoid device discovery hangs on runners without attached devices.
+    # Make the build target explicit and device-independent.
     set +e
     xcodebuild -project app/DroidVM.xcodeproj -scheme DroidVM \
         -sdk iphoneos -configuration Release -derivedDataPath "$BUILD/derived" \

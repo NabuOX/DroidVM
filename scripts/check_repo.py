@@ -59,6 +59,7 @@ REQUIRED_FILES = [
     "engine/symbols/required-symbols.txt",
     "engine/symbols/required-engine-symbols.txt",
     "engine/qemu-native/droidvm_qemu_runtime.c",
+    "engine/qemu-native/droidvm_qemu_display.c",
     "engine/qemu-native/meson.build",
     "engine/patches/droidvm-qemu-main-loop.patch",
     "engine/patches/README.md",

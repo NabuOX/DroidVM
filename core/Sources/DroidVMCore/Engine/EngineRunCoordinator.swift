@@ -80,6 +80,14 @@ public final class EngineRunCoordinator {
     private let bridge: NativeBridgeProbing
     private let confirmer: RuntimeConfirming
     private let display: DisplayBackend?
+    /// The engine's own display telemetry, when the runtime can provide it. A closure rather than
+    /// a protocol: there is one production source and one test stub, and a protocol for that is
+    /// ceremony that has to be implemented twice.
+    private let displayTelemetry: (() -> EngineRunReport.DisplayObservation)?
+    /// Told whether a host surface is bound, from the display result this coordinator already
+    /// decides. Not a second observer: `MetalDisplaySurface` used to report this too, which meant
+    /// two detection paths for one fact and two chances to disagree.
+    private let noteHostAttachment: ((Bool) -> Void)?
     private let surface: DisplaySurfaceHandle?
     private let recorder: DiagnosticsRecorder
     private let profile: RuntimeProfile
@@ -102,6 +110,8 @@ public final class EngineRunCoordinator {
                 confirmer: RuntimeConfirming,
                 display: DisplayBackend? = nil,
                 surface: DisplaySurfaceHandle? = nil,
+                displayTelemetry: (() -> EngineRunReport.DisplayObservation)? = nil,
+                noteHostAttachment: ((Bool) -> Void)? = nil,
                 profile: RuntimeProfile = RuntimeProfile(),
                 confirmationTimeout: TimeInterval = engineConfirmationTimeout,
                 displayTimeout: TimeInterval = displayAttachmentTimeout,
@@ -114,6 +124,8 @@ public final class EngineRunCoordinator {
         self.displayTimeout = displayTimeout
         self.display = display
         self.surface = surface
+        self.displayTelemetry = displayTelemetry
+        self.noteHostAttachment = noteHostAttachment
         self.profile = profile
         self.recorder = recorder
     }
@@ -338,10 +350,12 @@ public final class EngineRunCoordinator {
         switch step {
         case .attached(true):
             report.displayInit = .pass
+            noteHostAttachment?(true)
             transition(to: .displayReady)
 
         case .attached(false):
             report.displayInit = .fail
+            noteHostAttachment?(false)
             transition(to: .failed(EngineRunFailure(
                 stage: .display,
                 reason: "The display could not be started.",
@@ -386,10 +400,24 @@ public final class EngineRunCoordinator {
     /// The rendered text goes into the log as one event, so the evidence survives the app
     /// being closed and does not depend on a screenshot of the screen.
     private func finish() {
-        recorder.emit(DiagnosticEventName.levelDReport, [
+        report.display = displayTelemetry?() ?? report.display
+
+        var fields: [String: DiagnosticValue] = [
             DiagnosticField.result: .string(report.result.rawValue),
             DiagnosticField.detail: .string(report.rendered.replacingOccurrences(of: "\n", with: " | ")),
-        ])
+            DiagnosticField.displayState: .string(report.display.state.reportName),
+            DiagnosticField.displayUpdates: .int(Int(clamping: report.display.updates)),
+            DiagnosticField.displaySurfaceReplacements:
+                .int(Int(clamping: report.display.surfaceReplacements)),
+        ]
+        // Absent, never zero, until a surface has been observed.
+        if let width = report.display.width { fields[DiagnosticField.displayWidth] = .int(width) }
+        if let height = report.display.height { fields[DiagnosticField.displayHeight] = .int(height) }
+        if let stride = report.display.stride { fields[DiagnosticField.displayStride] = .int(stride) }
+        fields[DiagnosticField.displayLastReason] =
+            report.display.reason.map { DiagnosticValue.string($0) } ?? .unknown
+
+        recorder.emit(DiagnosticEventName.levelDReport, fields)
         publish()
     }
 

@@ -47,6 +47,7 @@ echo "==> integrating DroidVM's QEMU runtime confirmation into $QEMU_TREE"
 REQUIRED_SOURCES=(
     "qemu-native/droidvm_qemu_runtime.c"
     "qemu-native/droidvm_qemu_runtime.h"
+    "qemu-native/droidvm_qemu_display.c"
     "qemu-native/meson.build"
     "include/DroidVMBridge.h"
 )
@@ -64,13 +65,15 @@ mkdir -p "$DEST"
 
 cp -f "$ENGINE/qemu-native/droidvm_qemu_runtime.c" "$DEST/"
 cp -f "$ENGINE/qemu-native/droidvm_qemu_runtime.h" "$DEST/"
+cp -f "$ENGINE/qemu-native/droidvm_qemu_display.c" "$DEST/"
 cp -f "$ENGINE/qemu-native/meson.build"            "$DEST/"
 # Flattened: Meson adds this directory to the include path, and the module includes the header
 # by name.
 cp -f "$ENGINE/include/DroidVMBridge.h"            "$DEST/"
 echo "  copied $(ls -1 "$DEST" | wc -l | tr -d ' ') file(s) into ${DEST#$QEMU_TREE/}"
 
-for f in droidvm_qemu_runtime.c droidvm_qemu_runtime.h meson.build DroidVMBridge.h; do
+for f in droidvm_qemu_runtime.c droidvm_qemu_runtime.h droidvm_qemu_display.c \
+         meson.build DroidVMBridge.h; do
     [ -f "$DEST/$f" ] || fail "copy did not produce $DEST/$f"
 done
 
@@ -139,13 +142,17 @@ fi
 SYMBOLS_FILE="$QEMU_TREE/system/qemu.symbols"
 [ -f "$SYMBOLS_FILE" ] || fail "no system/qemu.symbols in $QEMU_TREE"
 
-# Queried by the app, and the one marker the app calls.
-WANTED=(
-    droidvm_runtime_state_get
-    droidvm_runtime_is_running
-    droidvm_runtime_last_reason
-    droidvm_runtime_note_initialized
-)
+# Read from the manifest rather than repeated here. Two lists that must agree eventually do
+# not, and this one had already drifted once.
+ENGINE_MANIFEST="$ENGINE/symbols/required-engine-symbols.txt"
+[ -f "$ENGINE_MANIFEST" ] || fail "no engine symbol manifest at engine/symbols/required-engine-symbols.txt"
+
+WANTED=()
+while IFS= read -r line; do
+    symbol="$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')"
+    [ -n "$symbol" ] && WANTED+=("$symbol")
+done < "$ENGINE_MANIFEST"
+[ "${#WANTED[@]}" -gt 0 ] || fail "the engine symbol manifest lists no symbols"
 
 added=0
 for symbol in "${WANTED[@]}"; do

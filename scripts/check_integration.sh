@@ -176,8 +176,9 @@ fi
 MANIFEST="$ROOT/engine/symbols/required-engine-symbols.txt"
 GOOD="$WORK/exports.good"
 BAD="$WORK/exports.bad"
-printf '%s\n' droidvm_runtime_state_get droidvm_runtime_is_running \
-              droidvm_runtime_last_reason droidvm_runtime_note_initialized > "$GOOD"
+# Derived from the manifest, not hardcoded: a fixed list silently becomes wrong the moment
+# a symbol is added, and the failure then looks like a checker bug rather than a stale test.
+grep -v '^#' "$MANIFEST" | sed '/^[[:space:]]*$/d' | tr -d ' ' > "$GOOD"
 # Everything except one: exactly the shape of "declared in a header, never compiled in".
 grep -v "^droidvm_runtime_is_running$" "$GOOD" > "$BAD"
 
@@ -287,6 +288,7 @@ else
     # 2-6. every integration input invalidates it.
     for rel in "engine/qemu-native/droidvm_qemu_runtime.c" \
                "engine/qemu-native/droidvm_qemu_runtime.h" \
+               "engine/qemu-native/droidvm_qemu_display.c" \
                "engine/patches/droidvm-qemu-main-loop.patch" \
                "engine/qemu-native/meson.build" \
                "scripts/integrate_engine.sh"; do
@@ -436,6 +438,25 @@ if grep -q "actions/cache/restore@v4" "$WORKFLOW" \
     check 0 "engine cache: explicit restore, and save before SYMBOL VERIFY (line $save_line)"
 else
     check 1 "engine cache: explicit restore, and save before SYMBOL VERIFY (save=${save_line:-none} symbol=${symbol_line:-none})"
+fi
+
+# The display listener is QEMU-private source: it must be COMPILED by QEMU's build, not merely
+# copied into the tree, and copied rather than assumed present.
+if grep -q "droidvm_qemu_display.c" "$QEMU/droidvm/meson.build"; then
+    check 0 "meson.build compiles the display listener"
+else
+    check 1 "meson.build compiles the display listener"
+fi
+if [ -f "$QEMU/droidvm/droidvm_qemu_display.c" ]; then
+    check 0 "the integration copies the display listener into the engine tree"
+else
+    check 1 "the integration copies the display listener into the engine tree"
+fi
+# And it must stay OUT of the app target, or APP LINK fails on QEMU's headers again.
+if grep -q '"qemu-native/\*\*"' "$ROOT/app/project.yml"; then
+    check 0 "the display listener stays out of the Xcode app target"
+else
+    check 1 "the display listener stays out of the Xcode app target"
 fi
 
 echo

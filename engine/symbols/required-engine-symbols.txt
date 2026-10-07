@@ -33,3 +33,10 @@ droidvm_runtime_last_reason
 # what knows qemu_init succeeded, and because INITIALIZED must be distinguishable from
 # NOT_STARTED when a start fails before the loop.
 droidvm_runtime_note_initialized
+
+# D.1b display lifecycle. Engine-owned for the same reason: only the engine can see
+# its own display console, and the app queries them through dlsym.
+droidvm_display_qemu_start
+droidvm_display_snapshot_get
+droidvm_display_qemu_last_reason
+droidvm_display_qemu_note_host_attachment

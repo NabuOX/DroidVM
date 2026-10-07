@@ -39,6 +39,22 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
     //
     // The alternative -- compiling a second copy of the runtime-state module into the app --
     // would give the process two states, and the app would read the one nothing ever writes.
+    // D.1b display lifecycle, from the same image.
+    //
+    // `displayStart` is the one CALL rather than a query: it arms the machine-init-done notifier
+    // that registers the DisplayChangeListener, and it must run BEFORE qemu_init -- the notifier
+    // fires during it. Nowhere else can do this, and forgetting it would leave the listener
+    // unregistered with no visible symptom.
+    private typealias DisplayStartFn = @convention(c) () -> Void
+    private typealias DisplayReasonFn = @convention(c) () -> UnsafePointer<CChar>?
+    private typealias DisplaySnapshotFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+    private typealias DisplayAttachFn = @convention(c) (Int32) -> Void
+
+    private var displayStart: DisplayStartFn?
+    private var displayReason: DisplayReasonFn?
+    private var displaySnapshot: DisplaySnapshotFn?
+    private var displayNoteAttach: DisplayAttachFn?
+
     private typealias RuntimeStateGetFn = @convention(c) () -> Int32
     private typealias RuntimeIsRunningFn = @convention(c) () -> Int32
     private typealias RuntimeLastReasonFn = @convention(c) () -> UnsafePointer<CChar>?
@@ -116,6 +132,11 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
         self.runtimeLastReason = Self.resolveFunction(handle, "droidvm_runtime_last_reason")
         self.runtimeNoteInitialized = Self.resolveFunction(handle, "droidvm_runtime_note_initialized")
 
+        self.displayStart = Self.resolveFunction(handle, "droidvm_display_qemu_start")
+        self.displayReason = Self.resolveFunction(handle, "droidvm_display_qemu_last_reason")
+        self.displaySnapshot = Self.resolveFunction(handle, "droidvm_display_snapshot_get")
+        self.displayNoteAttach = Self.resolveFunction(handle, "droidvm_display_qemu_note_host_attachment")
+
         self.handle = handle
         self.plan = plan
     }
@@ -164,6 +185,10 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
                 for pointer in argv where pointer != nil { free(pointer) }
                 return
             }
+
+            // BEFORE qemu_init: the notifier that registers the display listener fires during
+            // it, and a listener armed afterwards would never register.
+            self.displayStart?()
 
             let initResult = initFn(Int32(argv.count - 1), &argv)
 
@@ -227,6 +252,16 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
         return running
     }
 
+    // MARK: Display (D.1b)
+
+    /// Tell the engine whether a host surface is bound.
+    ///
+    /// Separate from the engine having a console, which is why it is a call rather than a flag the
+    /// engine could read: only the app knows whether it has somewhere to put a frame.
+    public func noteHostDisplayAttachment(_ attached: Bool) {
+        displayNoteAttach?(attached ? 1 : 0)
+    }
+
     // MARK: RuntimeStateProviding
 
     /// The engine's own execution state, read from the engine image.
@@ -284,5 +319,51 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
 
     deinit {
         if let handle { dlclose(handle) }
+    }
+}
+
+// MARK: DisplayTelemetryProviding
+
+extension QEMURuntime {
+
+    /// The engine's display facts, read from the loaded dylib in ONE snapshot.
+    ///
+    /// This is the consumer the display ABI exists for: the Level D report is what a device test
+    /// reads, so the engine's own observation reaches a user without a screenshot.
+    ///
+    /// Geometry is left ABSENT until a real surface has been observed. The C side reports zeroes
+    /// before then, and a zero is not a measurement -- reporting 0x0 would be indistinguishable
+    /// from a guest that is drawing nothing.
+    public func displayObservation() -> EngineRunReport.DisplayObservation {
+        var observation = EngineRunReport.DisplayObservation()
+
+        guard let displaySnapshot else {
+            // The symbols did not resolve, so the engine cannot answer. Recorded as not attempted
+            // with the reason, never as a zero-sized surface.
+            observation.reason = "the engine does not export its display telemetry"
+            return observation
+        }
+
+        // One read, so the geometry and the state cannot come from different moments.
+        // The bridge header is imported, so the C struct is the only definition needed.
+        var snapshot = droidvm_display_snapshot()
+        withUnsafeMutableBytes(of: &snapshot) { buffer in
+            displaySnapshot(buffer.baseAddress)
+        }
+
+        observation.state = DroidVMDisplayState(rawValue: snapshot.state) ?? .notAttempted
+        observation.updates = snapshot.updates
+        observation.surfaceReplacements = snapshot.surfaceReplacements
+        if snapshot.width > 0, snapshot.height > 0 {
+            observation.width = Int(snapshot.width)
+            observation.height = Int(snapshot.height)
+            observation.stride = Int(snapshot.stride)
+        }
+
+        if let reasonFn = displayReason, let cString = reasonFn() {
+            let reason = String(cString: cString)
+            observation.reason = reason.isEmpty ? nil : reason
+        }
+        return observation
     }
 }

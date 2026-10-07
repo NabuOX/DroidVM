@@ -132,7 +132,9 @@ final class EngineRunTests: XCTestCase {
         bridge: StubBridge = StubBridge(),
         confirmer: StubConfirmer = StubConfirmer(),
         display: StubDisplay? = StubDisplay(),
-        withSurface: Bool = true
+        withSurface: Bool = true,
+        telemetry: (() -> EngineRunReport.DisplayObservation)? = nil,
+        recorder: DiagnosticsRecorder = DiagnosticsRecorder()
     ) -> EngineRunCoordinator {
         EngineRunCoordinator(engine: engine,
                              jit: jit,
@@ -140,9 +142,22 @@ final class EngineRunTests: XCTestCase {
                              confirmer: confirmer,
                              display: display,
                              surface: withSurface ? StubSurface() : nil,
+                             displayTelemetry: telemetry,
                              confirmationTimeout: 0.05,
                              displayTimeout: 0.05,
-                             recorder: DiagnosticsRecorder())
+                             recorder: recorder)
+    }
+
+    /// Run a coordinator with the engine's display telemetry, and return the `level_d_report`
+    /// line it emitted.
+    private func runAndCapture(
+        _ observation: EngineRunReport.DisplayObservation = EngineRunReport.DisplayObservation()
+    ) async -> String {
+        let ring = RingBufferSink(capacity: 50)
+        let recorder = DiagnosticsRecorder()
+        recorder.add(ring)
+        _ = await makeCoordinator(telemetry: { observation }, recorder: recorder).run()
+        return ring.contents.last { $0.contains("level_d_report") } ?? ""
     }
 
     // MARK: 6. the full path passes only when everything passes
@@ -506,8 +521,12 @@ final class EngineRunTests: XCTestCase {
 
         XCTAssertEqual(lines.first, "LEVEL D DEVICE REPORT")
         XCTAssertEqual(Array(lines.dropFirst().map { String($0.split(separator: ":")[0]) }),
+                       // The display observation sits with the verdict it qualifies. These
+                       // keys are part of the report format, so adding one is deliberate.
                        ["app_launch", "runtime_controller", "jit", "jit_reason",
                         "native_bridge", "qemu_init", "qemu_started", "display_init",
+                        "display_state", "display_width", "display_height", "display_stride",
+                        "display_updates", "display_surface_replacements", "display_last_reason",
                         "crash", "failure_reason", "result"])
         XCTAssertTrue(report.rendered.hasSuffix("result: PASS"))
     }
@@ -598,4 +617,66 @@ final class EngineRunTests: XCTestCase {
         }
         XCTAssertNil(slow, "an operation that outlives its deadline yields no value")
     }
+
+    // MARK: display telemetry in the diagnostics export
+
+    /// The display state reaches the structured export, so a device log says which stage ran.
+    func testDiagnosticsCarryTheDisplayState() async {
+        var observation = EngineRunReport.DisplayObservation()
+        observation.state = .listenerRegistered
+        observation.reason = "display listener registered against console 0"
+
+        let line = await runAndCapture(observation)
+
+        XCTAssertTrue(line.contains("\"display_state\":\"LISTENER REGISTERED\""), line)
+        XCTAssertTrue(line.contains("\"display_last_reason\":\"display listener registered"), line)
+    }
+
+    /// THE rule of this level: geometry is ABSENT until a surface exists, never zero. A zero would
+    /// be indistinguishable from a guest that is drawing nothing.
+    func testGeometryIsAbsentUntilASurfaceIsObserved() async {
+        var observation = EngineRunReport.DisplayObservation()
+        observation.state = .listenerRegistered
+
+        let line = await runAndCapture(observation)
+
+        XCTAssertFalse(line.contains("\"display_width\""), "a width was invented: \(line)")
+        XCTAssertFalse(line.contains("\"display_height\""), "a height was invented")
+        XCTAssertFalse(line.contains("\"display_stride\""), "a stride was invented")
+        XCTAssertTrue(line.contains("\"display_last_reason\":null"),
+                      "an unknown reason must be null, not an empty string: \(line)")
+    }
+
+    /// And when a surface IS observed, the geometry is the surface's.
+    func testObservedGeometryIsReported() async {
+        var observation = EngineRunReport.DisplayObservation()
+        observation.state = .attached
+        observation.width = 1280
+        observation.height = 720
+        observation.stride = 5120
+        observation.updates = 3
+        observation.surfaceReplacements = 1
+
+        let line = await runAndCapture(observation)
+
+        XCTAssertTrue(line.contains("\"display_width\":1280"), line)
+        XCTAssertTrue(line.contains("\"display_height\":720"), line)
+        XCTAssertTrue(line.contains("\"display_stride\":5120"), line)
+        XCTAssertTrue(line.contains("\"display_updates\":3"), line)
+        XCTAssertTrue(line.contains("\"display_surface_replacements\":1"), line)
+    }
+
+
+
+
+    /// Unobserved geometry renders as `-`, in the report's existing style, rather than as 0.
+    func testUnobservedGeometryRendersAsAbsent() {
+        let lines = EngineRunReport.DisplayObservation().renderedLines
+        XCTAssertTrue(lines.contains("display_width: -"), "\(lines)")
+        XCTAssertTrue(lines.contains("display_height: -"))
+        XCTAssertTrue(lines.contains("display_stride: -"))
+        XCTAssertTrue(lines.contains("display_last_reason: -"))
+        XCTAssertTrue(lines.contains("display_updates: 0"))
+    }
+
 }

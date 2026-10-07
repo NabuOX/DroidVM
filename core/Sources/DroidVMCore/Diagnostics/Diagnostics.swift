@@ -104,6 +104,17 @@ public enum DiagnosticField {
 
     /// A verdict, as it appears in a report line. See `EngineRunReport.Verdict`.
     public static let result = "result"
+
+    // Display telemetry, from the engine's QEMU display listener. The geometry keys are ABSENT
+    // rather than zero until a surface has been observed, so a reader cannot mistake "not yet" for
+    // a real 0x0 measurement.
+    public static let displayState = "display_state"
+    public static let displayWidth = "display_width"
+    public static let displayHeight = "display_height"
+    public static let displayStride = "display_stride"
+    public static let displayUpdates = "display_updates"
+    public static let displaySurfaceReplacements = "display_surface_replacements"
+    public static let displayLastReason = "display_last_reason"
 }
 
 // MARK: - Encoding

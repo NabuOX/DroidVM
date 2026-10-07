@@ -42,6 +42,7 @@ public final class MetalDisplaySurface: DisplayBackend, @unchecked Sendable {
     private let device: MTLDevice
     private var attachedFlag = false
 
+
     public init?(device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
         guard let device else { return nil }
         self.device = device

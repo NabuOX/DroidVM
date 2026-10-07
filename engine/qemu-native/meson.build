@@ -38,6 +38,9 @@
 # source set applies to the whole set.
 
 system_ss.add(files('droidvm_qemu_runtime.c'))
+# The display listener. Compiles against QEMU's own ui/console.h, which is why it can
+# only live here -- the app target excludes qemu-native/** entirely.
+system_ss.add(files('droidvm_qemu_display.c'))
 
 # The include path that makes `droidvm_qemu_runtime.h` discoverable from the patched
 # system/runstate.c in the same source set.

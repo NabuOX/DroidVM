@@ -220,6 +220,60 @@ const char *droidvm_runtime_last_reason(void);
  * because separate translation units in one dylib link without joining the export list. */
 void droidvm_runtime_note_initialized(void);
 
+/* ------------------------------------------------------------------ *
+ * Display integration (D.1b)
+ *
+ * The lifecycle of DroidVM's QEMU DisplayChangeListener. Every value here
+ * is written by QEMU's main loop thread and read by the app, so they are
+ * atomics on the engine side.
+ *
+ * SEPARATE FROM THE FRAME COUNTERS ABOVE, ON PURPOSE. "QEMU has a graphic
+ * console" and "frames are reaching the screen" are different facts, and
+ * collapsing them is how a console would start meaning a working display.
+ * Nothing here reports readiness.
+ *
+ * Arming MUST happen before qemu_init: the machine-init-done notifier that
+ * performs the registration fires during it.
+ * ------------------------------------------------------------------ */
+
+typedef enum droidvm_display_state {
+    DROIDVM_DISPLAY_NOT_ATTEMPTED       = 0,
+    DROIDVM_DISPLAY_LISTENER_REGISTERED = 1,  /* console validated and bound */
+    DROIDVM_DISPLAY_ATTACHED            = 2,  /* a host surface is bound too */
+    DROIDVM_DISPLAY_DETACHED            = 3,
+    DROIDVM_DISPLAY_FAILED              = 4
+} droidvm_display_state;
+
+/* Arm the notifier that registers the listener. Call before qemu_init. */
+void droidvm_display_qemu_start(void);
+
+/* One consistent read of every display fact.
+ *
+ * A snapshot rather than a getter per field, for two reasons. Reading width and
+ * height separately can observe geometry from two DIFFERENT surfaces, which is
+ * exactly the stale-size bug this integration exists to avoid. And one export is
+ * one thing to keep in step with the app.
+ *
+ * width/height/stride are ZERO until a surface has been observed. Zero is not a
+ * measurement, which is why the app reports absent rather than 0x0. */
+typedef struct droidvm_display_snapshot {
+    int state;                              /* droidvm_display_state */
+    int width;
+    int height;
+    int stride;
+    unsigned long long updates;             /* real QEMU gfx update callbacks */
+    unsigned long long surface_replacements;
+} droidvm_display_snapshot;
+
+void droidvm_display_snapshot_get(droidvm_display_snapshot *out);
+
+/* Why the state is what it is. Static storage; never empty. */
+const char *droidvm_display_qemu_last_reason(void);
+
+/* Called by the app when it binds or loses a host surface. Not the same fact
+ * as the engine having a console, which is why it is a separate call. */
+void droidvm_display_qemu_note_host_attachment(int attached);
+
 #ifdef __cplusplus
 }
 #endif
