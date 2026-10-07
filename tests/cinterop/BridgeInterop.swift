@@ -34,6 +34,9 @@ func shim_init_calls() -> Int32
 func shim_init_argc() -> Int32
 @_silgen_name("droidvm_shim_qemu_main_loop_calls")
 func shim_main_loop_calls() -> Int32
+@_silgen_name("droidvm_shim_qemu_cleanup_status")
+func shim_cleanup_status() -> Int32
+
 @_silgen_name("droidvm_shim_qemu_cleanup_calls")
 func shim_cleanup_calls() -> Int32
 @_silgen_name("droidvm_shim_qemu_init_argv0")
@@ -370,11 +373,12 @@ func testStringsAndArgumentVector() {
 
     // char ** in, read back out of C. The typealias matches QEMURuntime's.
     shim_reset()
+    // Matches QEMURuntime's typealias and QEMU's own declarations.
     typealias InitFn = @convention(c) (Int32,
                                        UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?)
-        -> Int32
+        -> Void
     typealias LoopFn = @convention(c) () -> Int32
-    typealias CleanupFn = @convention(c) () -> Void
+    typealias CleanupFn = @convention(c) (Int32) -> Void
 
     let arguments = ["droidvm-engine", "-M", "virt", "-smp", "4"]
     var argv = arguments.map { strdup($0) }
@@ -384,8 +388,9 @@ func testStringsAndArgumentVector() {
     let loopFn = unsafeBitCast(qemu_main_loop as LoopFn, to: LoopFn.self)
     let cleanupFn = unsafeBitCast(qemu_cleanup as CleanupFn, to: CleanupFn.self)
 
-    check(initFn(Int32(argv.count - 1), &argv) == 0, "qemu_init succeeded through a pointer")
-    check(shim_init_calls() == 1, "and was called once")
+    // No result to assert: qemu_init returns void, so the call and the argc/argv are the evidence.
+    initFn(Int32(argv.count - 1), &argv)
+    check(shim_init_calls() == 1, "qemu_init was called once through a pointer")
     check(shim_init_argc() == Int32(arguments.count),
           "argc arrived intact: \(shim_init_argc())")
 
@@ -396,8 +401,10 @@ func testStringsAndArgumentVector() {
 
     check(loopFn() == 0, "qemu_main_loop through a pointer")
     check(shim_main_loop_calls() == 1, "counted")
-    cleanupFn()
+    cleanupFn(7)
     check(shim_cleanup_calls() == 1, "qemu_cleanup through a pointer")
+    check(shim_cleanup_status() == 7,
+          "qemu_cleanup's status argument arrived: \(shim_cleanup_status())")
 
     for p in argv where p != nil { free(p) }
 }

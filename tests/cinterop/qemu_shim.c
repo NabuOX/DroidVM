@@ -29,8 +29,9 @@ static char g_init_argv0[256];
 static char g_init_argv1[256];
 static int g_main_loop_calls = 0;
 static int g_cleanup_calls = 0;
+static int g_cleanup_status = -1;
 
-int qemu_init(int argc, char **argv)
+void qemu_init(int argc, char **argv)
 {
     g_init_calls++;
     g_init_argc = argc;
@@ -43,7 +44,6 @@ int qemu_init(int argc, char **argv)
         strncpy(g_init_argv1, argv[1], sizeof(g_init_argv1) - 1);
         g_init_argv1[sizeof(g_init_argv1) - 1] = '\0';
     }
-    return 0;
 }
 
 int qemu_main_loop(void)
@@ -52,9 +52,11 @@ int qemu_main_loop(void)
     return 0;
 }
 
-void qemu_cleanup(void)
+void qemu_cleanup(int status)
 {
     g_cleanup_calls++;
+    /* Recorded so the ABI test can prove the argument arrives, not just that the call happened. */
+    g_cleanup_status = status;
 }
 
 /* ------------------------------------------------------------------ *
@@ -69,6 +71,7 @@ int droidvm_shim_qemu_init_calls(void)      { return g_init_calls; }
 int droidvm_shim_qemu_init_argc(void)       { return g_init_argc; }
 int droidvm_shim_qemu_main_loop_calls(void) { return g_main_loop_calls; }
 int droidvm_shim_qemu_cleanup_calls(void)   { return g_cleanup_calls; }
+int droidvm_shim_qemu_cleanup_status(void)  { return g_cleanup_status; }
 
 const char *droidvm_shim_qemu_init_argv0(void) { return g_init_argv0; }
 const char *droidvm_shim_qemu_init_argv1(void) { return g_init_argv1; }

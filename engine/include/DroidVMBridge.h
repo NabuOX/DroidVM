@@ -42,16 +42,23 @@ extern "C" {
  * boundary is the Swift protocol above them, not a prefix here.
  * ------------------------------------------------------------------ */
 
-/* Build the machine. Returns 0 on success. argv follows QEMU's own
- * conventions; DroidVM constructs it in QEMULaunchPlanBuilder so that
+/* THESE MUST MATCH QEMU'S OWN DECLARATIONS, character for character, because this header is
+ * included from engine-side sources that have already included QEMU's. A mismatch is a compile
+ * error inside QEMU, and the authority is include/system/system.h.
+ *
+ * Build the machine. Returns NOTHING: QEMU exits the process itself on a fatal configuration
+ * error, so returning at all is the success signal. It was declared `int` here until gate 3
+ * caught the conflict -- and the Swift side was comparing that non-existent return value
+ * against zero. argv follows QEMU's conventions; DroidVM builds it in QEMULaunchPlanBuilder so
  * the machine definition stays a testable value. */
-int qemu_init(int argc, char **argv);
+void qemu_init(int argc, char **argv);
 
 /* Run until the machine stops. Blocking; called on its own thread. */
 int qemu_main_loop(void);
 
-/* Tear down after main_loop returns. */
-void qemu_cleanup(void);
+/* Tear down after main_loop returns. Takes QEMU's exit status; calling it with no argument
+ * passed whatever the register held. */
+void qemu_cleanup(int status);
 
 /* ------------------------------------------------------------------ *
  * Executable memory

@@ -172,9 +172,11 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
                 technical: "engine entry points vanished between prepare and start"))
         }
 
-        typealias InitFn = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32
+        // Signatures must match QEMU's; see the note in DroidVMBridge.h.
+        typealias InitFn = @convention(c)
+            (Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Void
         typealias LoopFn = @convention(c) () -> Int32
-        typealias CleanupFn = @convention(c) () -> Void
+        typealias CleanupFn = @convention(c) (Int32) -> Void
 
         let initFn = unsafeBitCast(qemuInit, to: InitFn.self)
         let loopFn = unsafeBitCast(qemuMainLoop, to: LoopFn.self)
@@ -190,27 +192,24 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
             // it, and a listener armed afterwards would never register.
             self.displayStart?()
 
-            let initResult = initFn(Int32(argv.count - 1), &argv)
+            // No result to test: returning at all means the machine was constructed.
+            initFn(Int32(argv.count - 1), &argv)
 
-            var loopResult: Int32 = -1
-            if initResult == 0 {
-                // INITIALIZED, not running. `markRunning(true)` is kept because VMEngineAdapter
-                // and the controller use it as their own status -- but it is NOT Level D's
-                // evidence, and nothing in the Level D path consults it. The loop marker, set
-                // from inside qemu_main_loop, is what produces `running`.
-                self.runtimeNoteInitialized?()
-                self.markRunning(true)
-                loopResult = loopFn()
-                cleanupFn()
-            }
+            // INITIALIZED, not running. `markRunning(true)` is kept because VMEngineAdapter
+            // and the controller use it as their own status -- but it is NOT Level D's evidence,
+            // and nothing in the Level D path consults it. The loop marker, set from inside
+            // qemu_main_loop, is what produces `running`.
+            self.runtimeNoteInitialized?()
+            self.markRunning(true)
+            let loopResult = loopFn()
+            cleanupFn(0)
             self.markRunning(false)
 
             for pointer in argv where pointer != nil { free(pointer) }
 
             // A machine that stopped without being asked is worth reporting; whether it is
             // a failure is decided above, because Android reboots itself on purpose.
-            self.reportExit(status: initResult != 0 ? initResult : loopResult,
-                            initFailed: initResult != 0)
+            self.reportExit(status: loopResult)
         }
 
         thread.name = "droidvm.engine"
@@ -299,7 +298,9 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
         lock.unlock()
     }
 
-    private func reportExit(status: Int32, initFailed: Bool) {
+    /// There is no init-failure branch. `qemu_init` returns void and exits the process itself on
+    /// a fatal configuration error, so anything reaching here built a machine and ran the loop.
+    private func reportExit(status: Int32) {
         lock.lock()
         lastExitStatus = status
         let wasStarted = started
@@ -307,9 +308,7 @@ public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
         lock.unlock()
 
         guard wasStarted else { return }
-        onUnexpectedExit?(initFailed
-            ? "qemu_init returned \(status)"
-            : "qemu_main_loop returned \(status)")
+        onUnexpectedExit?("qemu_main_loop returned \(status)")
     }
 
     private static func resolve(_ handle: UnsafeMutableRawPointer,

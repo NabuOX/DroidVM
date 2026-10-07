@@ -44,7 +44,16 @@ chmod +x "$FAKE/scripts/integrate_engine.sh"
 
 # A stand-in QEMU tree: exactly the three files the integration reads or writes.
 mkfixture() {
-    rm -rf "$QEMU"; mkdir -p "$QEMU/system"
+    rm -rf "$QEMU"; mkdir -p "$QEMU/system" "$QEMU/include/system"
+
+# QEMU's real entry-point declarations, copied from include/system/system.h of 10.0.12-utm. The
+# bridge header must agree with these character for character: it is included from engine-side
+# sources that have already included this file, so a difference is a compile error inside QEMU.
+cat > "$QEMU/include/system/system.h" <<'EOF'
+void qemu_init(int argc, char **argv);
+int qemu_main_loop(void);
+void qemu_cleanup(int);
+EOF
     cat > "$QEMU/meson.build" <<'EOF'
 project('qemu', 'c')
 system_ss = ss.source_set()
@@ -459,7 +468,38 @@ else
     check 1 "the display listener stays out of the Xcode app target"
 fi
 
+# ---------------------------------------------------------------- QEMU entry-point ABI
+#
+# A COMPILE, not a text comparison. Gate 3 failed because a translation unit included QEMU's own
+# header and DroidVMBridge.h together and the declarations conflicted; reimplementing that
+# judgement with a regex would only test my spelling. The probe does what QEMU's build does.
+cat > "$WORK/abi_probe.c" <<'EOF'
+#include "system/system.h"
+#include "DroidVMBridge.h"
+int main(void) { return 0; }
+EOF
+if cc -std=c11 -Wall -Wextra -Werror \
+      -I"$QEMU/include" -I"$ROOT/engine/include" \
+      -c "$WORK/abi_probe.c" -o "$WORK/abi_probe.o" 2> "$WORK/abi_probe.log"; then
+    check 0 "QEMU's header and the bridge header compile in one translation unit"
+else
+    check 1 "QEMU's header and the bridge header conflict: $(head -1 "$WORK/abi_probe.log")"
+fi
+
+# The probe must be able to fail, or its success says nothing. This header declares qemu_init the
+# way DroidVM wrongly did, and the probe must reject it.
+cat > "$WORK/abi_probe_bad.c" <<'EOF'
+#include "system/system.h"
+int qemu_init(int argc, char **argv);
+EOF
+if cc -std=c11 -I"$QEMU/include" -c "$WORK/abi_probe_bad.c" -o /dev/null 2>/dev/null; then
+    check 1 "the ABI probe rejects a mismatched qemu_init (it did not)"
+else
+    check 0 "the ABI probe rejects a mismatched qemu_init"
+fi
+
 echo
+if [ "$fail" -eq 0 ]; thenecho
 if [ "$fail" -eq 0 ]; then
     echo "  integration regression: PASS ($pass checks)"
     exit 0
