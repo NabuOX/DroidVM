@@ -366,53 +366,36 @@ def check_project_format():
 def check_app_target_excludes_qemu_internals():
     """QEMU-internal sources must not be compiled by the Xcode app target.
 
-    A source that needs QEMU's headers can only be built inside QEMU's own build, so it must not
-    be reachable from the app target. The first time this went wrong, Xcode compiled
-    engine/qemu-native/droidvm_qemu_runtime.c and APP LINK died with
-    "fatal error: 'qemu/osdep.h' file not found" -- after every other gate had passed, which
-    reads like a link problem rather than a mis-scoped source.
-
-    Two checks, and deliberately no more: the exclusion is present, and nothing outside the
-    excluded directory needs QEMU's headers unconditionally. Portable files carry such an include
-    only inside `#ifdef DROIDVM_WITH_QEMU`, which Xcode never preprocesses.
+    They include QEMU's own headers, which only exist inside QEMU's build. When one reached the
+    app target, APP LINK failed with "'qemu/osdep.h' file not found" after every other gate had
+    passed -- which reads like a link problem rather than a mis-scoped source.
     """
-    spec_path = os.path.join(ROOT, "app", "project.yml")
-    if not os.path.isfile(spec_path):
+    path = os.path.join(ROOT, "app", "project.yml")
+    if not os.path.isfile(path):
         return
-    with open(spec_path, "r", encoding="utf-8") as fh:
-        spec = fh.read()
-
-    if '"qemu-native/**"' not in spec:
-        fail("app/project.yml does not exclude qemu-native/**, so the app target would compile "
-             "QEMU-internal sources")
-        return
-
-    offenders = []
-    engine = os.path.join(ROOT, "engine")
-    for dirpath, dirnames, filenames in os.walk(engine):
-        if os.path.relpath(dirpath, engine).startswith("qemu-native"):
-            continue
+    with open(path, "r", encoding="utf-8") as fh:
+        if '"qemu-native/**"' not in fh.read():
+            fail("app/project.yml does not exclude qemu-native/**, so the app target would "
+                 "compile QEMU-internal sources")
+            return
+    # The one engine source outside qemu-native/ that may mention QEMU's headers; it carries the
+    # include inside `#ifdef DROIDVM_WITH_QEMU`, which Xcode never preprocesses. Adding another
+    # is a deliberate act.
+    allowed = {"engine/native/droidvm_display.c"}
+    found = set()
+    for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, "engine")):
+        dirnames[:] = [d for d in dirnames if d != "qemu-native"]
         for name in filenames:
-            if not name.endswith((".c", ".h")):
-                continue
-            full = os.path.join(dirpath, name)
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                guarded = 0
-                for lineno, line in enumerate(fh, 1):
-                    s = line.strip()
-                    if s.startswith("#ifdef DROIDVM_WITH_QEMU") or \
-                       s.startswith("#if defined(DROIDVM_WITH_QEMU)"):
-                        guarded += 1
-                    elif s.startswith("#endif") and guarded:
-                        guarded -= 1
-                    elif "#include" in s and "qemu/" in s and not guarded:
-                        offenders.append("%s:%d" % (os.path.relpath(full, ROOT), lineno))
-
-    if offenders:
-        fail("these files need QEMU's headers outside engine/qemu-native/: %s"
-             % ", ".join(offenders))
+            if name.endswith((".c", ".h")):
+                full = os.path.join(dirpath, name)
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    if "qemu/" in fh.read():
+                        found.add(os.path.relpath(full, ROOT).replace("\\", "/"))
+    if found - allowed:
+        fail("engine sources reference QEMU's headers outside the allowed set: %s"
+             % ", ".join(sorted(found - allowed)))
     else:
-        ok("app target: no QEMU-internal source reachable outside engine/qemu-native/")
+        ok("app target: qemu-native/** excluded from the app target")
 
 
 # ------------------------------------------------------------------- main
