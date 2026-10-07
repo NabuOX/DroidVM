@@ -150,7 +150,7 @@ jobs:
         run: ./scripts/build_engine_ios.sh symbols
 
       - name: PACKAGE IPA
-        run: DROIDVM_ENGINE_LIB="$PWD/build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib" ./scripts/package_ipa.sh "build/DroidVM-${GITHUB_SHA:0:7}.ipa"
+        run: ./scripts/package_ipa.sh
 
       - name: stage result
         run: |
@@ -164,8 +164,8 @@ jobs:
       - name: upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DroidVM-${GITHUB_SHA:0:7}-ipa
-          path: build/DroidVM-*.ipa
+          name: DroidVM-${{ github.sha }}-ipa
+          path: build/DroidVM.ipa
           if-no-files-found: error
 
       - name: upload stage result
