@@ -99,6 +99,31 @@ if grep -qE "^subdir\('droidvm'\)" "$QEMU/meson.build"; then
 else
     check 1 "top-level meson.build includes subdir('droidvm')"
 fi
+# The IncludeDirs defect: QEMU's SourceSet.add rejects IncludeDirs and accepts Dependency, which
+# failed Meson setup on CI with "argument 2 was of type IncludeDirs". The include path must reach
+# Meson as a Dependency.
+if grep -q "declare_dependency" "$QEMU/droidvm/meson.build"; then
+    check 0 "meson.build passes the include path as a Dependency"
+else
+    check 1 "meson.build passes the include path as a Dependency"
+fi
+# ...and never as a bare IncludeDirs object, which is the form that failed.
+# The exact broken SHAPE: a source set given a bare include-path variable as a second
+# argument. Matching "add(...include_directories(" is wrong -- it also matches the correct
+# declare_dependency(include_directories: ...) form, because [^)]* crosses an opening paren.
+if grep -qE "^[[:space:]]*[a-z_]+_ss\.add\(files\([^)]*\),[[:space:]]*[a-z_]+_inc\)" "$QEMU/droidvm/meson.build"; then
+    check 1 "no IncludeDirs object is passed to a source set"
+else
+    check 0 "no IncludeDirs object is passed to a source set"
+fi
+# system/runstate.c includes the internal header, so the dependency has to be on the set that also
+# contains runstate.c -- not on a private set that is merely merged in.
+if grep -q "system_ss.add(declare_dependency" "$QEMU/droidvm/meson.build"; then
+    check 0 "the include dependency is on system_ss (the set holding runstate.c)"
+else
+    check 1 "the include dependency is on system_ss (the set holding runstate.c)"
+fi
+
 for f in droidvm_qemu_runtime.c droidvm_qemu_runtime.h DroidVMBridge.h meson.build; do
     if [ -f "$QEMU/droidvm/$f" ]; then
         check 0 "copied into the engine tree: $f"
