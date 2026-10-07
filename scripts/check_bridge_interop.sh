@@ -132,6 +132,10 @@ echo "NATIVE COMPILE: PASS (${#NATIVE_SOURCES[@]} engine sources, -Wall -Wextra 
 echo
 echo "--- SYMBOL MANIFEST (engine/symbols/required-symbols.txt) ---"
 MANIFEST="engine/symbols/required-symbols.txt"
+# The engine-only manifest: symbols the QEMU dylib exports and the app does not
+# define. Checked here only to keep the bridge header from declaring something that
+# is gated nowhere; gate 3 checks it against the built engine.
+ENGINE_MANIFEST="engine/symbols/required-engine-symbols.txt"
 if [ ! -f "$MANIFEST" ]; then
     echo "  FAIL: the symbol manifest is missing" >&2
     exit 1
@@ -177,8 +181,11 @@ declared="$(grep -oE '\b(droidvm_[a-z_]+|qemu_[a-z_]+)\(' engine/include/DroidVM
             | tr -d '(' | sort -u)"
 while IFS= read -r symbol; do
     [ -z "$symbol" ] && continue
-    if ! grep -qE "^[[:space:]]*${symbol}[[:space:]]*$" "$MANIFEST"; then
-        printf '  %-46s DECLARED IN BRIDGE, ABSENT FROM MANIFEST\n' "$symbol"
+    # Either manifest satisfies it. A symbol the bridge declares must be gated SOMEWHERE, but
+    # which manifest depends on which image defines it: the app's objects, or the engine dylib.
+    if ! grep -qE "^[[:space:]]*${symbol}[[:space:]]*$" "$MANIFEST" \
+       && ! grep -qE "^[[:space:]]*${symbol}[[:space:]]*$" "$ENGINE_MANIFEST"; then
+        printf '  %-46s DECLARED IN BRIDGE, IN NEITHER MANIFEST\n' "$symbol"
         undeclared=$((undeclared + 1))
     fi
 done <<< "$declared"

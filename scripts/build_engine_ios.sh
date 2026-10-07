@@ -645,6 +645,19 @@ run_symbols() {
     # with no continuation: the second line began with a quote, so the shell read it as a
     # COMMAND name and failed with "command not found" -- after every check had already
     # succeeded, which made a passing layer look like a failing one.
+    # ---- TIER 3: symbols that must be exported BY THE ENGINE ITSELF --------------
+    #
+    # Delegated so the rule is testable: this script needs macOS tooling, so while the check was
+    # inline the host gate could not exercise it at all. scripts/check_engine_symbols.sh takes a
+    # plain export list, so the host gate proves it refuses a missing symbol.
+    local engine_exports="$BUILD/engine-exports.txt"
+    printf '%s\n' "$exports" > "$engine_exports"
+    "$ROOT/scripts/check_engine_symbols.sh" \
+        "$ROOT/engine/symbols/required-engine-symbols.txt" \
+        "$engine_exports" \
+        "$dir/_droidvm_build" \
+        || die "the built engine is missing required DroidVM runtime symbols"
+
     echo "  SYMBOL VERIFY: PASS"
     echo "    $declared declared: $from_dylib exported by the engine, $from_app defined in the app"
     echo "    engine architecture verified: arm64"

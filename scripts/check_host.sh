@@ -152,6 +152,19 @@ else
 fi
 echo
 
+# ---------------------------------------------------------------- integration regression
+#
+# The build integration was previously verified by hand, once. These run it against a fixture
+# QEMU tree, so a regression in integrate_engine.sh fails the host gate rather than gate 3.
+
+echo "--- integration regression (D.1a) ---"
+if "$ROOT/scripts/check_integration.sh"; then
+    :
+else
+    stage_fail "integration regression"
+fi
+echo
+
 # ---------------------------------------------------------------- guard tests
 #
 # Guards that cannot fail are not guards. Two of them live in shell scripts that cannot run on

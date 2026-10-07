@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Symbols that must be exported BY THE ENGINE -- the QEMU dylib -- and are deliberately absent
+# from the app's objects.
+#
+# WHY THIS IS A SECOND FILE
+#
+# The runtime state has exactly one owner: the QEMU dylib. Only the engine can observe its own
+# main loop, so the marker written inside qemu_main_loop() and the value Swift reads must be the
+# same storage. A second copy compiled into the app would mean the app reading a value nothing
+# ever writes -- a permanent "not running" against a machine that is running, which is worse
+# than no answer at all.
+#
+# `required-symbols.txt` is checked by the HOST gate, which links engine/native/*.c. These
+# symbols live in engine/qemu-native/ and are built only inside QEMU, so they belong here, where
+# gate 3 checks them against the BUILT dylib.
+#
+# WHAT IS NOT HERE, AND WHY
+#
+# droidvm_runtime_note_loop_iteration, _loop_exited and _note_failed are called only from other
+# QEMU sources inside the same dylib. Separate translation units link against each other without
+# joining the dynamic export list, so exporting them would widen the ABI for nothing and make
+# this gate assert something no caller needs.
+#
+# Format: one bare symbol per line; `#` starts a comment.
+
+# Queried by DroidVMRuntimeConfirmation, resolved with dlsym from the loaded engine.
+droidvm_runtime_state_get
+droidvm_runtime_is_running
+droidvm_runtime_last_reason
+
+# The one control symbol the app calls, after qemu_init returns 0. Exported because the app is
+# what knows qemu_init succeeded, and because INITIALIZED must be distinguishable from
+# NOT_STARTED when a start fails before the loop.
+droidvm_runtime_note_initialized

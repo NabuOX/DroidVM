@@ -1,43 +1,28 @@
 #!/bin/bash
-# DroidVM: wire the engine into QEMU's source tree, and maintain the export list.
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Wire DroidVM's QEMU integration into the engine's source tree.
 #
 #   ./scripts/integrate_engine.sh <path-to-qemu-source-tree>
 #
-# STATUS: PREPARED, NEVER RUN. Called by scripts/build_engine_ios.sh during gate 3. There is no
-# macOS runner yet, so this has never executed. Treat it as a specification of the steps.
+# Called by scripts/build_engine_ios.sh before QEMU is configured.
 #
-# WHY THIS EXISTS AS A SEPARATE STEP
+# WHAT THIS FIXES
 #
-# QEMU cannot be vendored into this repository: it is fetched and cross-compiled. DroidVM's own
-# engine sources therefore have to be copied into QEMU's tree and wired into its build, which
-# means three things have to keep agreeing -- the copies, the meson targets, and the export
-# list. Doing that by hand once is fine; doing it on every build is how a stale copy ships.
+# The previous version listed source paths that did not exist (`display/droidvm-display.c`,
+# `display/droidvm-display-gl.c`), reported them as "absent, skipped", and never wired anything
+# into Meson. Three separate ways for the build to succeed while integrating nothing: the files
+# were never copied, never compiled, and the only symptom was a symbol missing at dlopen.
 #
-# THE EXPORT LIST IS THE PART THAT MATTERS
+# This version copies only files that exist, FAILS LOUDLY if a required one is absent, applies
+# the main-loop patch, and adds the Meson subdir that actually compiles the module.
 #
-# QEMU's shared-library build exports only the symbols named in `system/qemu.symbols`. A symbol
-# missing from that list **links successfully and fails at `dlopen`**, and a symbol left in it
-# after the code is gone fails differently. Both are confusing, and neither is caught by a
-# compile. So this stage prunes names that no longer exist and adds names that do, rather than
-# appending.
+# WHAT IT DELIBERATELY DOES NOT DO
 #
-# Adapted from the reference implementation's integration script; see THIRD_PARTY.md. The
-# reasoning above is that script's, and it is the reason this one exists as its own step.
-#
-# NOT CALLED YET, AND THAT IS DELIBERATE
-#
-# scripts/build_engine_ios.sh does not invoke this, because at this stage DroidVM's bridge
-# compiles into the APP target and nothing needs to live inside QEMU's tree.
-#
-# It will be needed, and the reason is worth naming rather than rediscovering. The display
-# listener is a QEMU `DisplayChangeListener`, registered with QEMU's display system, and the
-# six counters are written from QEMU's callbacks -- so the listener and the counters must be in
-# the same image. That means moving the bridge into the dylib and having the Swift adapters
-# resolve `droidvm_*` through `dlsym` exactly as they resolve `qemu_*`.
-#
-# Copying the bridge into QEMU's tree first would put two sets of counters in one process, and
-# the app would read the wrong one. So the order is: prove the link (Level C), then move the
-# bridge, then make the machine run.
+# It does not copy engine/native/*.c into QEMU, and it does not touch the display listener.
+# The runtime state has exactly ONE owner -- the QEMU dylib -- because a second copy in the app
+# would mean the app reading a value nothing ever writes. The display listener is a separate
+# integration with its own ownership question.
 set -euo pipefail
 
 QEMU_TREE="${1:-}"
@@ -48,112 +33,151 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINE="$ROOT/engine"
+PATCHES="$ENGINE/patches"
+PATCH_NAME="droidvm-qemu-main-loop.patch"
 
-echo "==> integrating $ENGINE into $QEMU_TREE"
+fail() { echo "  FAIL: $*" >&2; exit 1; }
 
-# ---------------------------------------------------------------- sources
+echo "==> integrating DroidVM's QEMU runtime confirmation into $QEMU_TREE"
+
+# ---------------------------------------------------------------- 1. required sources
 #
-# The C and assembly that must live inside QEMU's tree, because they include QEMU's own
-# headers and are compiled by its build. The Swift adapters are NOT copied: they compile in the
-# app target and reach this code only through the bridge header.
-WIRED_SOURCES=(
-    "jit/droidvm_jit.c"
-    "jit/droidvm-brk.S"
-    "display/droidvm-display.c"
-    "display/droidvm-display-gl.c"
+# Required means required. A missing integration source is a broken build, not a note in a log.
+
+REQUIRED_SOURCES=(
+    "qemu-native/droidvm_qemu_runtime.c"
+    "qemu-native/droidvm_qemu_runtime.h"
+    "qemu-native/meson.build"
     "include/DroidVMBridge.h"
 )
 
-copied=0
-for rel in "${WIRED_SOURCES[@]}"; do
-    src="$ENGINE/$rel"
-    if [ ! -f "$src" ]; then
-        echo "  absent, skipped: engine/$rel"
-        continue
-    fi
-    # The include directory is flattened: QEMU's build expects headers where it is told to look.
-    case "$rel" in
-        include/*) dest="$QEMU_TREE/droidvm/$(basename "$rel")" ;;
-        *)         dest="$QEMU_TREE/droidvm/$rel" ;;
-    esac
-    mkdir -p "$(dirname "$dest")"
-    cp -f "$src" "$dest"
-    echo "  copied engine/$rel -> ${dest#$QEMU_TREE/}"
-    copied=$((copied + 1))
+for rel in "${REQUIRED_SOURCES[@]}"; do
+    [ -f "$ENGINE/$rel" ] || fail "required integration source is missing: engine/$rel"
 done
-echo "  $copied file(s) wired in"
+echo "  all ${#REQUIRED_SOURCES[@]} required source(s) present"
 
-if [ "$copied" -eq 0 ]; then
-    echo
-    echo "NOTE: no C sources exist under engine/ yet. The Swift adapters are in place and their"
-    echo "      ABI is verified on the host (scripts/check_bridge_interop.sh), but the C side of"
-    echo "      the bridge -- the trap, vm_remap, the DisplayChangeListener -- is a Phase 2"
-    echo "      deliverable. Until it exists, gate 3 cannot produce a dylib and says so."
+# ---------------------------------------------------------------- 2. copy
+
+DEST="$QEMU_TREE/droidvm"
+rm -rf "$DEST"
+mkdir -p "$DEST"
+
+cp -f "$ENGINE/qemu-native/droidvm_qemu_runtime.c" "$DEST/"
+cp -f "$ENGINE/qemu-native/droidvm_qemu_runtime.h" "$DEST/"
+cp -f "$ENGINE/qemu-native/meson.build"            "$DEST/"
+# Flattened: Meson adds this directory to the include path, and the module includes the header
+# by name.
+cp -f "$ENGINE/include/DroidVMBridge.h"            "$DEST/"
+echo "  copied $(ls -1 "$DEST" | wc -l | tr -d ' ') file(s) into ${DEST#$QEMU_TREE/}"
+
+for f in droidvm_qemu_runtime.c droidvm_qemu_runtime.h meson.build DroidVMBridge.h; do
+    [ -f "$DEST/$f" ] || fail "copy did not produce $DEST/$f"
+done
+
+# ---------------------------------------------------------------- 3. main-loop patch
+
+[ -f "$PATCHES/$PATCH_NAME" ] || fail "required patch is missing: engine/patches/$PATCH_NAME"
+
+RUNSTATE="$QEMU_TREE/system/runstate.c"
+[ -f "$RUNSTATE" ] || fail "no system/runstate.c in $QEMU_TREE; the engine tree is not QEMU 10"
+
+if grep -q "droidvm_runtime_note_loop_iteration" "$RUNSTATE"; then
+    echo "  runstate.c already carries the loop markers"
+else
+    echo "  applying $PATCH_NAME"
+    ( cd "$QEMU_TREE" && patch -p1 -N < "$PATCHES/$PATCH_NAME" ) \
+        || fail "$PATCH_NAME did not apply to system/runstate.c"
 fi
 
-# ---------------------------------------------------------------- export list
+# Both markers, verified by name. The entry marker must be INSIDE the loop body: if it moved
+# above the `while`, a loop that exits immediately would report as running.
+grep -q "droidvm_runtime_note_loop_iteration" "$RUNSTATE" \
+    || fail "the entry marker is not in system/runstate.c after patching"
+grep -q "droidvm_runtime_note_loop_exited" "$RUNSTATE" \
+    || fail "the exit marker is not in system/runstate.c after patching"
+echo "  loop markers verified in system/runstate.c"
+
+# ---------------------------------------------------------------- 4. Meson wiring
+
+TOP_MESON="$QEMU_TREE/meson.build"
+[ -f "$TOP_MESON" ] || fail "no top-level meson.build in $QEMU_TREE"
+
+if grep -qE "^subdir\('droidvm'\)" "$TOP_MESON"; then
+    echo "  meson.build already wired"
+else
+    # `subdir('system')` is where QEMU adds the softmmu sources to `system_ss`, and `system_ss`
+    # is what feeds the shared library. Adding ours after it means `system_ss` exists and the
+    # library is defined later. Anywhere else and the source set is empty or the variable is
+    # undefined.
+    grep -q "system_ss = ss.source_set()" "$TOP_MESON" \
+        || fail "cannot find 'system_ss = ss.source_set()' in the QEMU meson.build; this tree's layout is not the one this integration was written for"
+    grep -qE "^subdir\('system'\)" "$TOP_MESON" \
+        || fail "cannot find subdir('system') in the QEMU meson.build"
+
+    python3 - "$TOP_MESON" <<'PYEOF'
+import io, sys
+p = sys.argv[1]
+t = io.open(p, encoding="utf-8").read()
+anchor = "subdir('system')"
+i = t.index(anchor)
+end = t.index("\n", i) + 1
+t = t[:end] + "\nsubdir('droidvm')\n" + t[end:]
+io.open(p, "w", encoding="utf-8", newline="\n").write(t)
+PYEOF
+    grep -qE "^subdir\('droidvm'\)" "$TOP_MESON" || fail "meson wiring did not take"
+    echo "  subdir('droidvm') added after subdir('system')"
+fi
+
+# ---------------------------------------------------------------- 5. export list
+#
+# QEMU's shared build exports ONLY the names in system/qemu.symbols. A symbol missing from it
+# links perfectly and fails at dlopen, which is why this is maintained here rather than trusted.
+#
+# The file is a linker version script: `{ sym; sym; ... };`. Appending after the closing brace
+# produces an invalid script, so names go INSIDE the block.
 
 SYMBOLS_FILE="$QEMU_TREE/system/qemu.symbols"
-echo
-echo "==> export list: ${SYMBOLS_FILE#$QEMU_TREE/}"
+[ -f "$SYMBOLS_FILE" ] || fail "no system/qemu.symbols in $QEMU_TREE"
 
-# The symbols DroidVM calls, and only those. Everything else QEMU exports is its own business.
+# Queried by the app, and the one marker the app calls.
 WANTED=(
-    qemu_init
-    qemu_main_loop
-    qemu_cleanup
-    droidvm_jit_probe
-    droidvm_jit_capture
-    droidvm_jit_release
-    droidvm_jit_last_reason
-    droidvm_display_register
-    droidvm_display_read
-    droidvm_display_is_attached
-    droidvm_display_set_attached
-    droidvm_display_counters_sizeof
-    droidvm_serial_bytes_written
+    droidvm_runtime_state_get
+    droidvm_runtime_is_running
+    droidvm_runtime_last_reason
+    droidvm_runtime_note_initialized
 )
 
-if [ ! -f "$SYMBOLS_FILE" ]; then
-    echo "  ERROR: no export list at system/qemu.symbols" >&2
-    exit 1
-fi
-
-# Which of the wanted symbols actually exist in the tree? A name in the list that nothing
-# defines is a name that must not be exported, and a name that is defined but absent from the
-# list is a name that will fail at dlopen.
-present=(); absent=()
+added=0
 for symbol in "${WANTED[@]}"; do
-    if grep -rqE "^[a-zA-Z_].*\b${symbol}\s*\(" "$QEMU_TREE" --include='*.c' --include='*.h' \
-            2>/dev/null; then
-        present+=("$symbol")
-    else
-        absent+=("$symbol")
+    if grep -qE "^[[:space:]]*${symbol};" "$SYMBOLS_FILE"; then
+        continue
     fi
+    python3 - "$SYMBOLS_FILE" "$symbol" <<'PYEOF'
+import io, sys
+path, symbol = sys.argv[1], sys.argv[2]
+lines = io.open(path, encoding="utf-8").read().splitlines(True)
+# Insert before the LAST line that closes the block.
+for i in range(len(lines) - 1, -1, -1):
+    if lines[i].strip() in ("};", "}"):
+        lines.insert(i, "  %s;\n" % symbol)
+        break
+else:
+    raise SystemExit("could not find the closing brace of the export list")
+io.open(path, "w", encoding="utf-8", newline="\n").writelines(lines)
+PYEOF
+    echo "  ADDED to export list: $symbol"
+    added=$((added + 1))
 done
+[ "$added" -eq 0 ] && echo "  export list already complete"
 
-echo "  defined in the tree : ${#present[@]}"
-for symbol in "${present[@]}"; do
-    if grep -qx "$symbol" "$SYMBOLS_FILE" 2>/dev/null; then
-        printf '    ok       %s\n' "$symbol"
-    else
-        printf '    ADDING   %s\n' "$symbol"
-        echo "$symbol" >> "$SYMBOLS_FILE"
-    fi
+for symbol in "${WANTED[@]}"; do
+    grep -qE "^[[:space:]]*${symbol};" "$SYMBOLS_FILE" \
+        || fail "$symbol is not in system/qemu.symbols; it would fail at dlopen"
 done
-
-echo "  not yet defined     : ${#absent[@]}"
-for symbol in "${absent[@]}"; do
-    printf '    absent   %s\n' "$symbol"
-    if grep -qx "$symbol" "$SYMBOLS_FILE" 2>/dev/null; then
-        printf '    PRUNING  %s (listed but nothing defines it)\n' "$symbol"
-        grep -vx "$symbol" "$SYMBOLS_FILE" > "$SYMBOLS_FILE.tmp"
-        mv "$SYMBOLS_FILE.tmp" "$SYMBOLS_FILE"
-    fi
-done
+echo "  ${#WANTED[@]} runtime symbol(s) verified present in the export list"
 
 echo
 echo "==> integration complete"
-echo "  Next: build QEMU with --enable-shared-lib, then check the dylib's exports."
-echo "  A symbol missing from the list links fine and fails at dlopen; build_engine_ios.sh"
-echo "  verifies the built dylib rather than trusting this step."
+echo "  The build now compiles droidvm/droidvm_qemu_runtime.c into the engine and exports the"
+echo "  runtime query symbols. scripts/build_engine_ios.sh verifies the BUILT dylib rather than"
+echo "  trusting this step -- a symbol listed here and not compiled still fails there."

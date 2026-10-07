@@ -2,26 +2,23 @@
 //
 // DroidVM's application target.
 //
-// WHAT THIS IS, AND WHAT IT IS DELIBERATELY IS NOT
+// WHAT THIS SCREEN IS
 //
-// This is the smallest real app that proves the engine links: it constructs a
-// `RuntimeController` wired to the actual engine adapters, and shows the lifecycle's own
-// label. That is the whole screen.
+// Level D's surface, and nothing more. One button, one status line, and a diagnostics section
+// that can be read out loud. Tapping "Start Android" runs the REAL runtime stack -- the same
+// `JITManager`, `VMEngineAdapter` over the engine, `MetalDisplaySurface` and native bridge the
+// product uses -- and stops at "the engine confirmed it is running".
 //
-// It is not the product UX. There is no Android screen, no APK library, no settings, no
-// onboarding, and nothing that looks like Android before it can possibly work. A placeholder
-// that pretended to be the product would be the most misleading thing in the repository.
+// IT DOES NOT BOOT ANDROID, AND IT DOES NOT PRETEND TO
 //
-// WHY IT EXISTS AT ALL
+// There is no Android screen, no progress percentage, no fake home screen. After a successful
+// run the status says "Engine started", which is exactly what happened: the machine is
+// executing and no guest operating system has come up. Anything more on this screen would be
+// the most misleading thing in the repository.
 //
-// Until now `typecheck_ios.sh` skipped the app stage because `app/DroidVMApp` did not exist,
-// so "iOS compile PASS" meant "everything except the application compiles". From this phase
-// the app is compiled too, and the gate fails if it is missing rather than silently passing
-// a stage with nothing in it.
-//
-// The view talks to `RuntimeController` and to nothing else. It does not construct a command
-// line, touch executable memory, or decide that boot has finished -- which is the rule the
-// reference implementation broke by letting views read boot state directly.
+// The status text comes from `EngineRunState.consumerLabel`, so the view never decides what to
+// say. Mechanism -- JIT, QEMU, the bridge -- appears only in the Diagnostics section, which is
+// opt-in.
 
 import SwiftUI
 import DroidVMCore
@@ -37,66 +34,84 @@ struct DroidVMApplication: App {
     }
 }
 
-/// Holds the one façade and republishes its snapshot for SwiftUI.
+/// Holds the runtime stack and republishes the Level D state for SwiftUI.
 ///
-/// `@MainActor` because every `RuntimeController` call is bound to the main executor; the
-/// controller documents that contract rather than enforcing it, so this is where it is
-/// honoured.
+/// `@MainActor` because every runtime call is bound to the main executor; the core documents
+/// that contract rather than enforcing it, so this is where it is honoured.
 @MainActor
 final class EngineModel: ObservableObject {
 
-    @Published private(set) var snapshot: RuntimeSnapshot = .initial
+    @Published private(set) var state: EngineRunState = .idle
+    @Published private(set) var report = EngineRunReport()
 
+    /// The lifecycle façade, kept wired for the level that needs it. It shares the same engine,
+    /// runtime provider and display as the Level D coordinator -- one runtime stack, two
+    /// façades -- because a second `VMEngineAdapter` would mean a second machine.
     private let controller: RuntimeController
+    private let coordinator: EngineRunCoordinator
+
     private var observer: UUID?
 
     init() {
         let recorder = DiagnosticsRecorder()
-        let ring = RingBufferSink(capacity: 400)
-        recorder.add(ring)
+        recorder.add(RingBufferSink(capacity: 400))
 
+        // The real adapters. No mock, no substitute branch, and nothing here is reachable in a
+        // build that does not have the engine linked.
         let jit = JITManager(backend: TrapExecutableMemory(), recorder: recorder)
-        let engine = VMEngineAdapter(backend: QEMURuntime(),
+
+        // ONE runtime instance, shared. It is the adapter's backend AND the runtime-state
+        // provider the confirmer asks, so the state read is the state the engine writes.
+        // Creating a second QEMURuntime here would load the dylib twice and ask a second copy.
+        let runtime = QEMURuntime()
+        let engine = VMEngineAdapter(backend: runtime,
                                      paths: EngineModel.machinePaths(),
                                      recorder: recorder)
 
-        let controller = RuntimeController(engine: engine,
+        // A display that could not be created is not fatal here: the surface is recorded as
+        // absent and the engine start is still attempted and still reported.
+        let display = MetalDisplaySurface()
+        let surface = display.map { MetalSurfaceHandle(layer: $0.layer) }
+
+        self.controller = RuntimeController(engine: engine,
                                            jit: jit,
-                                           display: MetalDisplaySurface(),
+                                           display: display,
                                            recorder: recorder)
-        self.controller = controller
+        self.coordinator = EngineRunCoordinator(engine: engine,
+                                                jit: jit,
+                                                bridge: DroidVMNativeBridgeProbe(),
+                                                // The engine is asked whether its execution
+                                                // path is running. It cannot answer yet, so
+                                                // this reports `unavailable` and the level
+                                                // fails rather than claiming a start it has no
+                                                // evidence for. See docs/level-d-device-test.md.
+                                                confirmer: DroidVMRuntimeConfirmation(provider: runtime),
+                                                display: display,
+                                                surface: surface,
+                                                recorder: recorder)
 
-        // Registered after every stored property is initialised, so capturing self weakly
-        // here is safe.
-        self.observer = controller.addObserver { [weak self] snapshot in
-            Task { @MainActor in self?.snapshot = snapshot }
+        // Registered after every stored property is initialised, so capturing self weakly is
+        // safe.
+        self.observer = coordinator.addObserver { [weak self] state, report in
+            Task { @MainActor in
+                self?.state = state
+                self?.report = report
+            }
         }
     }
 
-    deinit {
-        if let observer {
-            // `removeObserver` is documented as main-executor-only; deinit of a
-            // main-actor-bound object is the one place that is awkward, so the observer id
-            // is simply dropped here and the controller's list dies with the model. Written
-            // explicitly so the intent is visible rather than implied.
-            _ = observer
-        }
-    }
-
-    func prepareAndStart() {
-        Task { await controller.start() }
+    func start() {
+        Task { await coordinator.run() }
     }
 
     func stop() {
-        Task { await controller.stop() }
+        Task { await coordinator.stop() }
     }
 
     /// Where the machine's files live.
     ///
-    /// Level C is a link gate: it proves the engine links and the app target compiles. It
-    /// does not need a guest image, and the brief forbids downloading one for this purpose.
-    /// These paths are therefore *locations*, not assertions that anything is there --
-    /// nothing in this target reads them.
+    /// Level D does not need a guest image and the brief forbids downloading one to prove it.
+    /// These are *locations*, not assertions that anything is there.
     private static func machinePaths() -> QEMULaunchPaths {
         let support = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -115,35 +130,85 @@ final class EngineModel: ObservableObject {
     }
 }
 
-/// The whole product surface for this phase.
+/// Level D's whole product surface.
 struct EngineStatusView: View {
 
     @ObservedObject var model: EngineModel
+    @State private var showsDiagnostics = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            Text("DroidVM")
-                .font(.largeTitle.weight(.semibold))
+        NavigationStack {
+            VStack(spacing: 24) {
+                Text("DroidVM")
+                    .font(.largeTitle.weight(.semibold))
 
-            Text("Engine build ready")
-                .font(.headline)
+                Text(model.state.consumerLabel)
+                    .font(.title3)
+                    .foregroundStyle(model.state.isFailure ? .red : .secondary)
+                    .accessibilityIdentifier("levelD.status")
 
-            // The lifecycle's own label. The view does not decide what to say; it renders
-            // what the state machine concluded, which is why a label can never describe a
-            // different moment than the number beside it.
-            Text(model.snapshot.label)
-                .font(.body)
-                .foregroundStyle(.secondary)
+                // The user-safe reason, when there is one. Never a mechanism string.
+                if let reason = model.report.failureReason {
+                    Text(reason)
+                        .font(.footnote)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                }
 
-            ProgressView(value: Double(model.snapshot.progressPercent), total: 100)
+                if model.state.isInProgress {
+                    ProgressView()
+                }
 
-            HStack(spacing: 12) {
-                Button("Check engine") { model.prepareAndStart() }
-                    .buttonStyle(.borderedProminent)
-                Button("Stop") { model.stop() }
-                    .buttonStyle(.bordered)
+                HStack(spacing: 12) {
+                    Button("Start Android") { model.start() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.state.isInProgress)
+
+                    Button("Stop") { model.stop() }
+                        .buttonStyle(.bordered)
+                        .disabled(!model.state.engineIsRunning)
+                }
+
+                Spacer()
+            }
+            .padding(32)
+            .navigationTitle("")
+            .toolbar {
+                ToolbarItem(placement: .bottomBar) {
+                    Button(showsDiagnostics ? "Hide diagnostics" : "Diagnostics") {
+                        showsDiagnostics.toggle()
+                    }
+                }
+            }
+            .sheet(isPresented: $showsDiagnostics) {
+                DiagnosticsView(state: model.state, report: model.report)
             }
         }
-        .padding(32)
+    }
+}
+
+/// The device report, and the developer-facing state name.
+///
+/// Everything the normal screen is not allowed to say lives here, behind a tap. This is what
+/// makes a device run checkable without a screenshot of a status line: the report is text, in a
+/// fixed order, and can be read, copied or photographed as a whole.
+struct DiagnosticsView: View {
+
+    let state: EngineRunState
+    let report: EngineRunReport
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(report.rendered)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Level D report")
+            .navigationBarTitleDisplayMode(.inline)
+        }
     }
 }

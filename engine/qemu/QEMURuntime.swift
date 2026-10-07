@@ -22,7 +22,7 @@ import DroidVMCore
 import Darwin
 
 /// A `VMRuntimeBackend` over the engine shared library.
-public final class QEMURuntime: VMRuntimeBackend {
+public final class QEMURuntime: VMRuntimeBackend, RuntimeStateProviding {
 
     /// The library inside the app bundle.
     public static let libraryName = "libqemu-aarch64-softmmu"
@@ -30,6 +30,23 @@ public final class QEMURuntime: VMRuntimeBackend {
     private var handle: UnsafeMutableRawPointer?
     private var thread: Thread?
     private var plan: QEMULaunchPlan?
+
+    // DroidVM's runtime-state queries, resolved from the SAME engine image as qemu_init.
+    //
+    // Resolved but not REQUIRED: an engine built before this integration, or one whose export
+    // list lost the symbol, simply cannot answer. That is reported as `unavailable` rather than
+    // treated as a fault, because "we could not ask" and "the answer is no" are different facts.
+    //
+    // The alternative -- compiling a second copy of the runtime-state module into the app --
+    // would give the process two states, and the app would read the one nothing ever writes.
+    private typealias RuntimeStateGetFn = @convention(c) () -> Int32
+    private typealias RuntimeIsRunningFn = @convention(c) () -> Int32
+    private typealias RuntimeLastReasonFn = @convention(c) () -> UnsafePointer<CChar>?
+    private typealias RuntimeNoteInitializedFn = @convention(c) () -> Void
+
+    private var runtimeStateGet: RuntimeStateGetFn?
+    private var runtimeLastReason: RuntimeLastReasonFn?
+    private var runtimeNoteInitialized: RuntimeNoteInitializedFn?
 
     /// Guards the small amount of state the QEMU thread and the caller share.
     private let lock = NSLock()
@@ -94,8 +111,20 @@ public final class QEMURuntime: VMRuntimeBackend {
             }
         }
 
+        // From the same image, and optional by design.
+        self.runtimeStateGet = Self.resolveFunction(handle, "droidvm_runtime_state_get")
+        self.runtimeLastReason = Self.resolveFunction(handle, "droidvm_runtime_last_reason")
+        self.runtimeNoteInitialized = Self.resolveFunction(handle, "droidvm_runtime_note_initialized")
+
         self.handle = handle
         self.plan = plan
+    }
+
+    /// Resolve and type-cast one exported symbol. `nil` when the engine does not export it.
+    private static func resolveFunction<T>(_ handle: UnsafeMutableRawPointer,
+                                           _ name: String) -> T? {
+        guard let symbol = dlsym(handle, name) else { return nil }
+        return unsafeBitCast(symbol, to: T.self)
     }
 
     public func start() throws {
@@ -140,6 +169,11 @@ public final class QEMURuntime: VMRuntimeBackend {
 
             var loopResult: Int32 = -1
             if initResult == 0 {
+                // INITIALIZED, not running. `markRunning(true)` is kept because VMEngineAdapter
+                // and the controller use it as their own status -- but it is NOT Level D's
+                // evidence, and nothing in the Level D path consults it. The loop marker, set
+                // from inside qemu_main_loop, is what produces `running`.
+                self.runtimeNoteInitialized?()
                 self.markRunning(true)
                 loopResult = loopFn()
                 cleanupFn()
@@ -191,6 +225,33 @@ public final class QEMURuntime: VMRuntimeBackend {
         lock.lock()
         defer { lock.unlock() }
         return running
+    }
+
+    // MARK: RuntimeStateProviding
+
+    /// The engine's own execution state, read from the engine image.
+    ///
+    /// `nil` when the symbol is absent, which the confirmer maps to `unavailable`.
+    ///
+    /// The numeric values are mirrored here from the C enum and pinned on the C side by
+    /// `_Static_assert`, so a divergence between the two fails a build instead of silently
+    /// reporting the wrong state.
+    public func runtimeState() -> DroidVMRuntimeState? {
+        guard let runtimeStateGet else { return nil }
+
+        let reason = runtimeLastReason.map { pointer -> String in
+            guard let cString = pointer() else { return "" }
+            return String(cString: cString)
+        } ?? ""
+
+        switch runtimeStateGet() {
+        case 0: return .notStarted
+        case 1: return .initialized
+        case 2: return .mainLoopEntered
+        case 3: return .mainLoopExited
+        case 4: return .failed(reason: reason.isEmpty ? "engine reported failure" : reason)
+        default: return nil
+        }
     }
 
     // MARK: internals

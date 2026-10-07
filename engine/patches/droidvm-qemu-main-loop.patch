@@ -1,0 +1,27 @@
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "droidvm_qemu_runtime.h"
+ #include "audio/audio.h"
+ #include "block/block.h"
+ #include "block/export.h"
+@@ -831,9 +832,16 @@
+ {
+     int status = EXIT_SUCCESS;
+ 
++    /* DroidVM: the entry marker lives INSIDE the loop body.
++     *
++     * Anywhere else -- before the while, before the call, after qemu_init -- and a loop that
++     * exits immediately would still be reported as running, which is the lie this exists to
++     * prevent. Reaching this line means an iteration genuinely began. */
+     while (!main_loop_should_exit(&status)) {
++        droidvm_runtime_note_loop_iteration();
+         main_loop_wait(false);
+     }
++    droidvm_runtime_note_loop_exited();
+ 
+     return status;
+ }

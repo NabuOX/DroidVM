@@ -58,6 +58,15 @@ public enum DiagnosticEventName: String, Equatable, CaseIterable, Sendable {
 
     case lifecycleChanged = "lifecycle_changed"
 
+    // --- Level D: the engine-run report ---
+
+    /// The Level D device report, rendered as one line.
+    ///
+    /// Emitted once per engine-run, on success and on failure alike, so the evidence for a
+    /// device run exists in the log and does not depend on a screenshot. The line carries the
+    /// verdict and the whole report with newlines folded to separators.
+    case levelDReport = "level_d_report"
+
     // --- resource sampling ---
 
     case memorySample = "memory_sample"
@@ -92,6 +101,9 @@ public enum DiagnosticField {
     public static let asset = "asset"
     public static let bytes = "bytes"
     public static let detail = "detail"
+
+    /// A verdict, as it appears in a report line. See `EngineRunReport.Verdict`.
+    public static let result = "result"
 }
 
 // MARK: - Encoding

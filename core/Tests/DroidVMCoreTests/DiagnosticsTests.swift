@@ -19,6 +19,8 @@ final class DiagnosticsTests: XCTestCase {
             "frame_received", "frame_presented", "frame_dropped",
             "display_no_scanout", "display_present_failed",
             "guest_alive_changed", "lifecycle_changed", "memory_sample",
+            // Level D. The engine-run report, so a device run leaves evidence in the log.
+            "level_d_report",
         ]
         let actual = Set(DiagnosticEventName.allCases.map(\.rawValue))
         XCTAssertTrue(required.isSubset(of: actual),
