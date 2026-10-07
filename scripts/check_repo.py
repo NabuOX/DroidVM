@@ -241,6 +241,60 @@ def check_identity_values():
 
 # ------------------------------------------------------------------- main
 
+# ------------------------------------------------------------------- modes
+
+def check_script_modes():
+    """Every tracked script must be executable in Git.
+
+    This exists because of a real failure. The scripts were created on Windows, where
+    `core.fileMode` is false and Git does not track the executable bit, so all of them were
+    committed as 100644. CI runs them directly:
+
+        ./scripts/check_host.sh: Permission denied     (exit 126)
+
+    Two consecutive runs failed on that and nothing else, because every other check in this
+    file looks at content and none looked at the mode.
+
+    The mode is read from the Git index, not the filesystem: the development machine's
+    filesystem cannot express it, which is what caused the bug.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(["git", "ls-files", "-s", "scripts/"],
+                                cwd=ROOT, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok("script modes: skipped (git unavailable: %s)" % exc)
+        return
+
+    if result.returncode != 0:
+        fail("could not read file modes from the Git index: %s" % result.stderr.strip())
+        return
+
+    offenders = []
+    checked = 0
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mode, path = parts[0], parts[3]
+        checked += 1
+        if mode != "100755":
+            offenders.append("%s has mode %s, expected 100755" % (path, mode))
+
+    if checked == 0:
+        fail("no tracked files under scripts/ -- the guard cannot be checking anything")
+        return
+
+    if offenders:
+        fail("scripts are not executable in Git. CI invokes them directly, so every job "
+             "will fail with 'Permission denied' (exit 126) before reaching a compiler:")
+        for entry in offenders:
+            failures.append("    " + entry)
+        failures.append("    fix with: git update-index --chmod=+x <path>")
+    else:
+        ok("script modes: all %d tracked scripts are 100755" % checked)
+
+
 def main():
     print("DroidVM repository guards")
     print("  root: %s" % ROOT)
@@ -251,6 +305,7 @@ def main():
     check_no_committed_assets()
     check_third_party_record()
     check_identity_values()
+    check_script_modes()
 
     for note in notes:
         print("  ok   %s" % note)
