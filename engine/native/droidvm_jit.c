@@ -381,7 +381,12 @@ static droidvm_jit_status diagnose_views(void *executable, void *writable, size_
     int match = -1; /* -1 means the comparison was not attempted. */
     int attempted = 0;
 
-    if ((exec_prot & VM_PROT_READ) != 0 && (write_prot & VM_PROT_WRITE) != 0) {
+    /* BOTH LOOKUPS MUST HAVE SUCCEEDED FIRST. `DROIDVM_REGION_UNMAPPED` is -1, and -1 has every
+     * bit set, so `-1 & VM_PROT_READ` is nonzero -- testing the bits alone would let an unmapped
+     * address pass and send memcpy into memory that is not there. That is the execute-fault crash
+     * this diagnostic exists to avoid, so the sentinel is excluded BEFORE the bits are read. */
+    if (exec_prot != DROIDVM_REGION_UNMAPPED && write_prot != DROIDVM_REGION_UNMAPPED &&
+        (exec_prot & VM_PROT_READ) != 0 && (write_prot & VM_PROT_WRITE) != 0) {
         attempted = 1;
         memcpy(writable, pattern, sizeof(pattern));
         sys_icache_invalidate(executable, sizeof(pattern));

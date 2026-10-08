@@ -271,12 +271,16 @@ else
     #
     # Matching the CONDITIONAL, not two strings that happen to appear elsewhere in the file: an
     # earlier version stayed green with the guard deleted, which is a check that cannot fail.
+    # The bits are not enough: `DROIDVM_REGION_UNMAPPED` is -1, so every bit test passes for an
+    # unmapped address. The sentinel must be excluded first, and this requires it.
     if grep -q 'exec_prot & VM_PROT_READ' "$JIT_C" \
        && grep -q 'write_prot & VM_PROT_WRITE' "$JIT_C" \
+       && grep -q 'exec_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
+       && grep -q 'write_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
        && grep -q 'mach_vm_region' "$JIT_C"; then
-        echo "  ok:   the readback is gated on exec_prot/write_prot from mach_vm_region"
+        echo "  ok:   the readback needs SUCCESSFUL lookups and the right protection bits"
     else
-        echo "      FAIL: the readback is not gated on the reported protection"
+        echo "      FAIL: an unmapped address could pass the readback guard (-1 has every bit set)"
         jit_failed=1
     fi
 
