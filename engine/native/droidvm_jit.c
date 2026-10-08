@@ -103,34 +103,26 @@ int droidvm_jit_platform_supported(void)
 #endif
 }
 
-/* ------------------------------------------------------------------ *
- * Is anything attached that could service the trap?
+/* Is anything attached that could service the trap?
  *
- * THE CHECK THAT MAKES THE PROBE SAFE. `brk` is the mechanism, so availability cannot be
- * discovered by attempting it: on a device with nothing attached, the attempt is not a failed
- * call, it is a dead process. The first physical-device run proved that -- EXC_BREAKPOINT,
- * `brk 61453`, inside droidvm_jit_break_get_mapping.
+ * THE CHECK THAT MAKES THE PROBE SAFE. `brk` IS the mechanism, so availability cannot be
+ * discovered by attempting it: with nothing attached, the attempt is not a failed call, it is a
+ * dead process -- EXC_BREAKPOINT, which is what the first device run produced.
  *
- * `P_TRACED` is set by the kernel while a debugger is tracing this process, which is precisely
- * when the trap has something to answer it. It costs a sysctl read: no trap, no allocation, and
- * no way to kill the caller. A failure to READ it is reported as "not attached", because the
- * conservative answer is the one that cannot crash.
- * ------------------------------------------------------------------ */
-
+ * P_TRACED is set by the kernel while a debugger traces this process, which is exactly when the
+ * trap has a responder. Reading it costs a sysctl: no trap, no allocation, nothing to survive.
+ */
 static int debugger_is_attached(void)
 {
 #if defined(__APPLE__)
-    int mib[4];
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)getpid() };
     struct kinfo_proc info;
     size_t size = sizeof(info);
 
     memset(&info, 0, sizeof(info));
-    mib[0] = CTL_KERN;
-    mib[1] = KERN_PROC;
-    mib[2] = KERN_PROC_PID;
-    mib[3] = (int)getpid();
-
     if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) {
+        /* Unreadable is reported as "not attached": the conservative answer is the one that
+         * cannot crash. */
         return 0;
     }
     return (info.kp_proc.p_flag & P_TRACED) != 0;

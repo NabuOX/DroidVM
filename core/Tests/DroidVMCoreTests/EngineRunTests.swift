@@ -391,7 +391,8 @@ final class EngineRunTests: XCTestCase {
         let jit = StubJIT()
         jit.result = .unavailable(reason: "Android needs a permission this app does not have yet.")
         let engine = StubEngine()
-        let coordinator = makeCoordinator(engine: engine, jit: jit)
+        let bridge = StubBridge()
+        let coordinator = makeCoordinator(engine: engine, jit: jit, bridge: bridge)
 
         let report = await coordinator.run()
 
@@ -399,6 +400,19 @@ final class EngineRunTests: XCTestCase {
         XCTAssertEqual(report.jitReason, "Android needs a permission this app does not have yet.")
         XCTAssertEqual(engine.startCalls, 0, "the engine was never asked")
         XCTAssertEqual(report.result, .fail)
+
+        // The whole point of stopping here: NOTHING downstream is attempted. Without these, a run
+        // that skipped the JIT stage and wandered into QEMU would still pass this test.
+        XCTAssertEqual(engine.prepareCalls, 0, "the engine was asked to prepare")
+        XCTAssertEqual(bridge.probeCalls, 0, "the bridge was probed")
+        XCTAssertEqual(report.nativeBridge, .notRun)
+        XCTAssertEqual(report.qemuInit, .notRun)
+        XCTAssertEqual(report.qemuStarted, .notRun)
+        XCTAssertEqual(report.displayInit, .notRun)
+
+        // And an environment limitation is reported as the environment's, not as a generic engine
+        // message -- this is what tells a reader whether DroidVM is broken or the device is.
+        XCTAssertEqual(report.failureReason, "Android needs a permission this app does not have yet.")
         guard case .failed(let failure) = coordinator.state else {
             return XCTFail("expected failed")
         }
@@ -706,46 +720,7 @@ final class EngineRunTests: XCTestCase {
 
     // MARK: no JIT environment stops the run, and the trail says where
 
-    /// THE DEVICE FAILURE, as a test. With no JIT-enabling environment the run must stop at the JIT
-    /// stage and never reach the engine -- and, before this fix, "reaching the engine" was not the
-    /// risk: the process died inside the probe itself, executing a trap nothing would service.
-    ///
-    /// The stub stands in for the probe's ANSWER. What is proven here is the coordinator's
-    /// behaviour given that answer: nothing downstream is attempted, and the level cannot pass.
-    func testJITUnavailableStopsBeforeTheEngineIsAsked() async {
-        let jit = StubJIT()
-        jit.result = .unavailable(reason: "no JIT-enabling environment is attached")
 
-        let engine = StubEngine()
-        let bridge = StubBridge()
-        let coordinator = makeCoordinator(engine: engine, jit: jit, bridge: bridge)
-
-        let report = await coordinator.run()
-
-        XCTAssertEqual(report.jit, .unavailable)
-        XCTAssertEqual(report.jitReason, "no JIT-enabling environment is attached")
-        XCTAssertEqual(report.nativeBridge, .notRun)
-        XCTAssertEqual(report.qemuInit, .notRun)
-        XCTAssertEqual(report.qemuStarted, .notRun)
-        XCTAssertEqual(report.displayInit, .notRun)
-        XCTAssertEqual(report.result, .fail, "an unavailable JIT produced a passing level")
-
-        XCTAssertEqual(engine.prepareCalls, 0, "the engine was asked to prepare")
-        XCTAssertEqual(engine.startCalls, 0, "the engine was asked to start")
-        XCTAssertEqual(bridge.probeCalls, 0, "the bridge was probed")
-    }
-
-    /// An unavailable JIT is not a failure of the engine, and the report must say so rather than
-    /// blaming QEMU for something QEMU was never asked to do.
-    func testJITUnavailableIsNotReportedAsAnEngineFailure() async {
-        let jit = StubJIT()
-        jit.result = .unavailable(reason: "nothing is attached to service the trap")
-        let report = await makeCoordinator(jit: jit).run()
-
-        XCTAssertEqual(report.jit, .unavailable)
-        XCTAssertEqual(report.failureReason, "nothing is attached to service the trap",
-                       "the reason must be the environment's, not a generic engine message")
-    }
 
     /// The trail brackets the probe, so a process killed inside it is attributable without a crash
     /// log: the trail ends at `jitProbeEntered` and a reader knows exactly which stage died.
