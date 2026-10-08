@@ -3,13 +3,13 @@
 // The trap protocol by which DroidVM asks an attached debugger for executable memory.
 //
 // STATUS: written in Phase 1, NOT ASSEMBLED and NOT RUN. It needs an arm64 iOS toolchain and
-// a device. scripts/check_engine.sh verifies only that the three instruction pairs are
-// present and that nothing has been added to them; it cannot assemble for arm64-ios here.
+// a device. scripts/check_engine.sh verifies only that these instruction pairs are present and that
+// nothing has been added to them; it cannot assemble for arm64-ios here.
 //
 // WHAT THIS IS, AND WHAT IT IS NOT
 //
-// These are TWO instruction pairs. Executing a `brk` is how a process asks whatever
-// debugger is attached to do something on its behalf.
+// DroidVM has two wrappers here, for two operations it performs: prepare and detach. Executing a
+// `brk` is how a process asks whatever debugger is attached to do something on its behalf.
 //
 // x16 carries the command. ARGUMENTS ARRIVE IN x0/x1, and the result is written back into x0
 // before the debugger resumes us -- so the trailing `ret` returns it.
@@ -22,16 +22,19 @@
 // This reproduces an *interface* -- the trap immediates and the register command numbers,
 // all of which are documented in the debugger's own published script -- not anybody's
 // creative expression. The reference implementation took the same position when it declined
-// to depend on an unlicensed binary that contained exactly these three pairs, and the
-// reasoning is recorded in THIRD_PARTY.md.
+// to depend on an unlicensed binary that contained these pairs, and the reasoning is recorded in
+// THIRD_PARTY.md.
 //
 // A NOTE ON THE COMMAND NUMBERS
 //
 //   0xf00d  the customary "map this for me / unmap it" trap. x16 = 1 asks for a mapping,
 //           x16 = 0 releases it.
 //
-// Both immediates appear in the debugger's own script, which is why following them is
-// following a protocol rather than copying an implementation.
+// This file describes the commands DROIDVM ISSUES and nothing else. It deliberately makes no claim
+// about how many commands the protocol defines in total: that is an external contract, this project
+// has not verified it, and an earlier revision asserted a total here that was simply wrong.
+//
+// `brk #0x69` is not used by DroidVM's current universal path. Nothing further is claimed about it.
 
 #if defined(__arm64__) || defined(__aarch64__)
 
@@ -56,8 +59,8 @@ _droidvm_jit_break_get_jit_mapping:
 // void droidvm_jit_break_detach(void)
 //   Let the provider go. x16 = 0 is the detach command.
 //
-//   The protocol has exactly two commands. A preparation that is never followed by a detach leaves
-//   the debugger's script attached and waiting, so this is called on every exit from the trap path.
+//   A preparation that is never followed by a detach leaves the debugger's script attached and
+//   waiting, so this is called on every exit from the trap path.
 .globl _droidvm_jit_break_detach
 _droidvm_jit_break_detach:
     mov x16, #0x0

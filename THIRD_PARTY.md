@@ -148,10 +148,13 @@ GPL project can take a dependency on. It turned out not to matter: the framework
 instruction pairs (`mov x16, #1 ; brk #0xf00d`, the same with `#0`, and `brk #0x69`),
 which are the *protocol* by which a debugger is asked for executable memory. DroidVM issues
 these traps in its own assembly (see `engine/jit/`), reproducing an interface rather
-than anyone's expression. **DroidVM's current universal path issues two of the three: prepare and detach.**
-`brk #0x69` is defined by the protocol but currently unused by DroidVM. No behaviour is
-attributed to it here: it has not been independently verified, and this record does not
-repeat another project's description of it as though it were established. That is recorded here precisely because it is the kind of
+than anyone's expression. **DroidVM implements two universal-protocol wrappers: prepare and detach.** This record states
+DroidVM's own implementation and makes no claim about how many commands or forms the external
+protocol defines in total -- that is an external contract, and it has not been verified here.
+
+`brk #0x69` is not used by DroidVM's current universal path. No behaviour is attributed to it:
+it has not been independently verified, and this record does not repeat another project's
+description of it as though it were established. That is recorded here precisely because it is the kind of
 judgement that should not be made silently.
 
 ## Cross-compiled dependencies of the engine

@@ -76,19 +76,23 @@ _BreakJITDetach:      mov x16, #0x0 ; brk #0xf00d ; ret
 _BreakMarkJITMapping: brk #0x69     ; ret
 ```
 
-**The external protocol contains three trap forms. DroidVM's current universal JIT path uses two of
-them:** the prepare form (`x16 = 1`, with the region address or NULL in `x0` and the length in `x1`)
-and the detach form (`x16 = 0`). The third form, `brk #0x69`, is currently unused by DroidVM.
+**DroidVM implements two universal-protocol wrappers: prepare and detach.** The prepare form uses
+`x16 = 1`, with the region address or NULL in `x0` and the length in `x1`; the detach form uses
+`x16 = 0`.
 
-It is written down here rather than deleted, because the protocol does define it and DroidVM does not
-use it. **No behaviour is attributed to it.** DroidVM has not independently verified what it does,
-and this record will not claim otherwise on someone else's word; if a later revision needs it, that
-verification is where the work starts.
+This record states DroidVM's own implementation and **deliberately makes no claim about how many
+commands or forms the external protocol defines in total.** That is an external contract, this
+project has not verified it, and an earlier revision of this file asserted a total that was wrong.
+
+`brk #0x69` is not used by DroidVM's current universal path. **No behaviour is attributed to it**:
+it has not been independently verified here, and this record will not repeat another project's
+description of it as though it were established. If a later revision needs it, that verification is
+where the work starts.
 
 What is being reproduced is an *interface* — the trap immediates and the register command
 numbers, all documented in StikDebug's own published JavaScript — not anyone's creative
-expression. Three instruction pairs dictated by an external protocol are not a meaningful
-authorship contribution. DroidVM writes them in its own assembly.
+expression. Instruction pairs dictated by an external protocol are not a meaningful authorship
+contribution. DroidVM writes them in its own assembly.
 
 This is also better engineering: no `dlopen` indirection, and no embedded framework
 carrying entitlements, which AMFI rejects on sideloaded builds at launch.

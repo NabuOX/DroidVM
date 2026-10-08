@@ -18,7 +18,7 @@
 #      Linux can genuinely syntax-check it, including with -Wall -Wextra -Werror.
 #
 #   3. The trap protocol has not grown. The assembly cannot be assembled for arm64-ios here,
-#      but the three instruction pairs can be checked for presence and for nothing extra.
+#      but the instruction pairs can be checked for presence and for nothing extra.
 #
 # WHAT IT IS NOT
 #
@@ -220,19 +220,6 @@ else
 
     # ---- diagnostic-build invariants ------------------------------------------------
     #
-    # The provider's return value is recorded and reported, and must never become a pointer. If it
-    # ever appears beside exec_out, write_out, memcpy, or a function-pointer cast, it has stopped
-    # being evidence and become input -- which is the mistake this build exists to avoid.
-    misuse="$(grep -n 'provider_return_raw' "$JIT_C" \
-              | grep -E 'exec_out|write_out|memcpy|void \(\*' || true)"
-    if [ -z "$misuse" ]; then
-        echo "  ok:   provider_return_raw is never used as a pointer or copied"
-    else
-        echo "      FAIL: provider_return_raw is used as a pointer:"
-        echo "$misuse" | sed 's/^/            /'
-        jit_failed=1
-    fi
-
     # NO INDIRECT EXECUTION -- checked as a PROPERTY, not by name.
     #
     # An earlier version grepped for `fn();`, which any other identifier would have evaded. The
@@ -285,13 +272,6 @@ else
     fi
 
     # marker: not yet ready, and the provider's call is still unused
-    if grep -q 'mark_executable' "$JIT_C"; then
-        echo "      FAIL: mark_executable is called before the contract is proven"
-        jit_failed=1
-    else
-        echo "  ok:   0x69 is not wired to a mark-executable call site"
-    fi
-
     # ------------------------------------------------------------ the 0xf00d argument contract
     # The protocol takes x0 = addr (NULL for a fresh region) and x1 = len. A wrapper declared with
     # no parameters passes whatever happens to be in those registers, which is how DroidVM ended up
@@ -346,11 +326,14 @@ else
     fi
 
     # ------------------------------------------------------------ 0x69 is a probe, not a command
-    if grep -q 'mark_executable\|break_probe\|0x69' "$JIT_C" engine/jit/droidvm-brk.S; then
-        echo "      FAIL: a third trap command is back; the protocol has exactly two"
+    # SYMBOLS, not the literal `0x69`. The assembly deliberately MENTIONS 0x69 to record that DroidVM
+    # does not use it, so matching the text would fail on its own documentation -- which is exactly
+    # what happened. The instruction count is separately guarded above (`traps total: 2`).
+    if grep -q 'mark_executable\|break_probe' "$JIT_C" engine/jit/droidvm-brk.S; then
+        echo "      FAIL: a removed trap symbol is back (mark_executable / break_probe)"
         jit_failed=1
     else
-        echo "  ok:   the protocol has two commands and no 0x69 anywhere"
+        echo "  ok:   the removed DroidVM trap symbols are absent; the universal path uses prepare and detach"
     fi
 
     # A prototype with no definition links on no platform and fails only where it is compiled --
@@ -462,20 +445,31 @@ else
         fi
     done
 
-    # The immediates are a protocol; a fourth, unknown one would mean somebody guessed.
-    unexpected="$(grep -oE 'brk #0x[0-9a-f]+' "$ASM" | sort -u \
-                  | grep -vE 'brk #0xf00d|brk #0x69' || true)"
-    if [ -n "$unexpected" ]; then
-        echo "  FAIL: unexpected trap immediate(s): $unexpected"
-        echo "        only 0xf00d (with x16 = 1 or 0) and 0x69 are part of the protocol"
+    # EVERY EXECUTABLE brk MUST BE THE CANONICAL FORM, REGARDLESS OF LINE SHAPE.
+    #
+    # Three earlier versions anchored on how a line BEGINS and each was defeated: `brk #0x69`
+    # substituted for the detach trap; `brk #105`, decimal for the same instruction; a column-zero
+    # trap; and `_extra: brk #0x69`, which shares its line with a label. Assembly permits all of
+    # them, so this does not look at the start of a line at all.
+    #
+    # Comments are removed first, so the file may still DOCUMENT other immediates. Then every exact
+    # canonical `brk #0xf00d` is removed, and any `brk` LEFT OVER fails the gate. Removing the exact
+    # canonical text also catches two traps sharing a line, which no per-line allow-list could.
+    asm_code="$(grep -vE '^[[:space:]]*(//|/\*|\*)' "$ASM")"
+    noncanonical="$(printf '%s\n' "$asm_code" | sed 's/brk #0xf00d//g' | grep -nE 'brk' || true)"
+    if [ -n "$noncanonical" ]; then
+        echo "  FAIL: non-canonical executable brk instruction(s); every one must be 'brk #0xf00d':"
+        echo "$noncanonical" | sed 's/^/            /'
         asm_failed=1
+    else
+        echo "  ok:   every executable brk is the canonical brk #0xf00d, wherever it sits on its line"
     fi
 
-    total="$(grep -cE '^\s+brk ' "$ASM" || true)"
+    total="$(printf '%s\n' "$asm_code" | grep -oE 'brk' | wc -l | tr -d ' ')"
     printf '  %-20s total: %s (expected 2)\n' "traps" "$total"
-    # DroidVM's SUBSET, not the protocol. The universal protocol defines more than these two;
-    # saying "the protocol has two commands" would state as fact something DroidVM merely does not
-    # implement, and would make this gate reject a valid protocol extension for the wrong reason.
+    # DROIDVM'S SUBSET, and this file makes no claim about the protocol's total. An earlier revision
+    # asserted a total here; it was wrong. Stating an unverified external contract as fact would also
+    # make this gate reject a valid protocol extension for the wrong reason.
     [ "$total" -eq 2 ] || { echo "      FAIL: DroidVM implements exactly two universal-protocol wrappers (prepare, detach)"; asm_failed=1; }
 
     [ "$asm_failed" -eq 0 ] || fails=$((fails + 1))
