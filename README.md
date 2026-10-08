@@ -16,7 +16,9 @@ required of the user.
 
 ## Download test IPA
 
-Current device-test build: **[Download DroidVM IPA (commit `3d2a233`)](https://github.com/NabuOX/DroidVM/actions/runs/37701349873/artifacts/11520325351)**
+Current device-test build: **[Download DroidVM IPA (commit `3d2a233`)](https://github.com/NabuOX/DroidVM/releases/download/v0.1.0-test1/DroidVM.ipa)**
+
+The same build is also available as [DroidVM.zip](https://github.com/NabuOX/DroidVM/releases/download/v0.1.0-test1/DroidVM.zip), and both files are listed with their release notes on the [v0.1.0-test1 release](https://github.com/NabuOX/DroidVM/releases/tag/v0.1.0-test1).
 
 This is an unsigned test IPA and must be re-signed by your sideloading/installation tool before installation.
 
