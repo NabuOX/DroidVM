@@ -52,6 +52,27 @@ final class EngineModel: ObservableObject {
 
     private var observer: UUID?
 
+    /// The crash-recovery trail.
+    ///
+    /// Application Support, not tmp: iOS may purge tmp between launches, and a trail that does not
+    /// survive the relaunch answers nothing about the run that died.
+    static let breadcrumbLog: StageBreadcrumbLog = {
+        let support = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let root = support.appendingPathComponent("DroidVM", isDirectory: true)
+        return StageBreadcrumbLog(url: root.appendingPathComponent("stage-breadcrumbs.txt"))
+    }()
+
+    /// What the last run reached. This is the whole point of the trail: after a kill, the report
+    /// describing the dead run is gone, and this names the stage it died in.
+    static var crashRecoverySummary: String {
+        guard let last = breadcrumbLog.lastReached else {
+            return "crash recovery: no run recorded"
+        }
+        return "crash recovery: last stage reached was \(last.label)"
+    }
+
     init() {
         let recorder = DiagnosticsRecorder()
         recorder.add(RingBufferSink(capacity: 400))
@@ -96,6 +117,7 @@ final class EngineModel: ObservableObject {
                                                 // engine's state follows the ONE place attachment
                                                 // is decided.
                                                 noteHostAttachment: { runtime.noteHostDisplayAttachment($0) },
+                                                breadcrumbs: EngineModel.breadcrumbLog,
                                                 recorder: recorder)
 
         // Registered after every stored property is initialised, so capturing self weakly is
@@ -213,6 +235,15 @@ struct DiagnosticsView: View {
                     .font(.system(.footnote, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                // The report above describes a run that FINISHED. When a run is killed there is no
+                // such report -- the process dies holding it -- and this trail is all that is left:
+                // it names the stage that was entered and never left.
+                Text(EngineModel.crashRecoverySummary)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 8)
                     .padding()
             }
             .navigationTitle("Level D report")

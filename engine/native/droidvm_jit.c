@@ -44,6 +44,8 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <sys/mman.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <libkern/OSCacheControl.h>
 #endif
@@ -102,6 +104,43 @@ int droidvm_jit_platform_supported(void)
 }
 
 /* ------------------------------------------------------------------ *
+ * Is anything attached that could service the trap?
+ *
+ * THE CHECK THAT MAKES THE PROBE SAFE. `brk` is the mechanism, so availability cannot be
+ * discovered by attempting it: on a device with nothing attached, the attempt is not a failed
+ * call, it is a dead process. The first physical-device run proved that -- EXC_BREAKPOINT,
+ * `brk 61453`, inside droidvm_jit_break_get_mapping.
+ *
+ * `P_TRACED` is set by the kernel while a debugger is tracing this process, which is precisely
+ * when the trap has something to answer it. It costs a sysctl read: no trap, no allocation, and
+ * no way to kill the caller. A failure to READ it is reported as "not attached", because the
+ * conservative answer is the one that cannot crash.
+ * ------------------------------------------------------------------ */
+
+static int debugger_is_attached(void)
+{
+#if defined(__APPLE__)
+    int mib[4];
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+
+    memset(&info, 0, sizeof(info));
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_PROC;
+    mib[2] = KERN_PROC_PID;
+    mib[3] = (int)getpid();
+
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) {
+        return 0;
+    }
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+#else
+    /* No debugger services a trap on the development host either. */
+    return 0;
+#endif
+}
+
+/* ------------------------------------------------------------------ *
  * Probe
  *
  * Non-destructive by contract: it must never trap and never allocate, because the Swift
@@ -120,10 +159,22 @@ droidvm_jit_status droidvm_jit_probe(void)
         droidvm_jit_set_reason("a region is already held");
         return DROIDVM_JIT_ALREADY_HELD;
     }
-    /* The mechanism is present but no region exists. `OK` here means exactly that, which is
-     * why the Swift mapping turns it into `unknown` rather than `available`: whether a
-     * region can actually be obtained is decided by capture, not by a probe. */
-    droidvm_jit_set_reason("mechanism available; no region held");
+    /* THE SAFETY GATE. Nothing below this line may execute a trap, and nothing above it has
+     * been tried. On a normal sideloaded launch no debugger is attached, the trap would not be
+     * serviced, and iOS would terminate the process -- so this answers UNAVAILABLE without
+     * executing anything. That is a real answer about a real limitation, not a fabricated
+     * failure: the environment genuinely cannot provide executable memory. */
+    if (!debugger_is_attached()) {
+        droidvm_jit_set_reason("no JIT-enabling environment is attached: the process is not "
+                               "being debugged, so the trap that provides executable memory "
+                               "would not be serviced and would terminate the app");
+        return DROIDVM_JIT_NOT_PERMITTED;
+    }
+
+    /* A debugger IS attached, so the trap has a responder. Whether a region can actually be
+     * obtained is still decided by capture, not by a probe -- which is why the Swift mapping
+     * turns this into `unknown` rather than `available`. */
+    droidvm_jit_set_reason("mechanism available and a debugger is attached; no region held");
     return DROIDVM_JIT_OK;
 }
 
@@ -259,6 +310,15 @@ droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
     if (!droidvm_jit_platform_supported()) {
         droidvm_jit_set_reason("executable memory is not available on this platform");
         return DROIDVM_JIT_UNSUPPORTED;
+    }
+
+    /* The probe refuses in this situation too. Checking again is not redundant: capture is
+     * reachable directly, and this is the last point before the instruction that cannot be
+     * survived. A caller that skips the probe must not be able to kill the process. */
+    if (!debugger_is_attached()) {
+        droidvm_jit_set_reason("refusing to execute the capture trap: no debugger is attached, "
+                               "so the trap would terminate the process rather than fail");
+        return DROIDVM_JIT_NOT_PERMITTED;
     }
 
     void *executable = NULL;

@@ -60,6 +60,28 @@ private final class StubJIT: JITProvider, @unchecked Sendable {
     func release() async { readiness = .unknown }
 }
 
+/// Records the trail in memory. The file-backed one is exercised in StageBreadcrumbsTests; here
+/// the question is WHICH stages a run reaches, and in what order.
+private final class RecordingBreadcrumbs: StageBreadcrumbRecording, @unchecked Sendable {
+    private let lock = NSLock()
+    private var trail: [LevelDStage] = []
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        trail = []
+    }
+
+    func record(_ stage: LevelDStage) {
+        lock.lock(); defer { lock.unlock() }
+        trail.append(stage)
+    }
+
+    var recorded: [LevelDStage] {
+        lock.lock(); defer { lock.unlock() }
+        return trail
+    }
+}
+
 private final class StubBridge: NativeBridgeProbing, @unchecked Sendable {
     var status = NativeBridgeStatus(ok: true, detail: "stub agrees")
     private(set) var probeCalls = 0
@@ -134,6 +156,7 @@ final class EngineRunTests: XCTestCase {
         display: StubDisplay? = StubDisplay(),
         withSurface: Bool = true,
         telemetry: (() -> EngineRunReport.DisplayObservation)? = nil,
+        breadcrumbs: StageBreadcrumbRecording? = nil,
         recorder: DiagnosticsRecorder = DiagnosticsRecorder()
     ) -> EngineRunCoordinator {
         EngineRunCoordinator(engine: engine,
@@ -143,6 +166,7 @@ final class EngineRunTests: XCTestCase {
                              display: display,
                              surface: withSurface ? StubSurface() : nil,
                              displayTelemetry: telemetry,
+                             breadcrumbs: breadcrumbs,
                              confirmationTimeout: 0.05,
                              displayTimeout: 0.05,
                              recorder: recorder)
@@ -679,4 +703,77 @@ final class EngineRunTests: XCTestCase {
         XCTAssertTrue(lines.contains("display_updates: 0"))
     }
 
+
+    // MARK: no JIT environment stops the run, and the trail says where
+
+    /// THE DEVICE FAILURE, as a test. With no JIT-enabling environment the run must stop at the JIT
+    /// stage and never reach the engine -- and, before this fix, "reaching the engine" was not the
+    /// risk: the process died inside the probe itself, executing a trap nothing would service.
+    ///
+    /// The stub stands in for the probe's ANSWER. What is proven here is the coordinator's
+    /// behaviour given that answer: nothing downstream is attempted, and the level cannot pass.
+    func testJITUnavailableStopsBeforeTheEngineIsAsked() async {
+        let jit = StubJIT()
+        jit.result = .unavailable(reason: "no JIT-enabling environment is attached")
+
+        let engine = StubEngine()
+        let bridge = StubBridge()
+        let coordinator = makeCoordinator(engine: engine, jit: jit, bridge: bridge)
+
+        let report = await coordinator.run()
+
+        XCTAssertEqual(report.jit, .unavailable)
+        XCTAssertEqual(report.jitReason, "no JIT-enabling environment is attached")
+        XCTAssertEqual(report.nativeBridge, .notRun)
+        XCTAssertEqual(report.qemuInit, .notRun)
+        XCTAssertEqual(report.qemuStarted, .notRun)
+        XCTAssertEqual(report.displayInit, .notRun)
+        XCTAssertEqual(report.result, .fail, "an unavailable JIT produced a passing level")
+
+        XCTAssertEqual(engine.prepareCalls, 0, "the engine was asked to prepare")
+        XCTAssertEqual(engine.startCalls, 0, "the engine was asked to start")
+        XCTAssertEqual(bridge.probeCalls, 0, "the bridge was probed")
+    }
+
+    /// An unavailable JIT is not a failure of the engine, and the report must say so rather than
+    /// blaming QEMU for something QEMU was never asked to do.
+    func testJITUnavailableIsNotReportedAsAnEngineFailure() async {
+        let jit = StubJIT()
+        jit.result = .unavailable(reason: "nothing is attached to service the trap")
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertEqual(report.jit, .unavailable)
+        XCTAssertEqual(report.failureReason, "nothing is attached to service the trap",
+                       "the reason must be the environment's, not a generic engine message")
+    }
+
+    /// The trail brackets the probe, so a process killed inside it is attributable without a crash
+    /// log: the trail ends at `jitProbeEntered` and a reader knows exactly which stage died.
+    func testTheTrailBracketsTheJITProbe() async {
+        let breadcrumbs = RecordingBreadcrumbs()
+        let jit = StubJIT()
+        jit.result = .unavailable(reason: "no JIT-enabling environment is attached")
+
+        _ = await makeCoordinator(jit: jit, breadcrumbs: breadcrumbs).run()
+        let trail = breadcrumbs.recorded
+
+        XCTAssertEqual(trail.prefix(5), [.appLaunch, .runtimeControllerEntered,
+                                         .runtimeControllerReturned,
+                                         .jitProbeEntered, .jitProbeReturned])
+        XCTAssertFalse(trail.contains(.nativeBridgeEntered),
+                       "the run advanced past the JIT stage it could not satisfy")
+    }
+
+    /// The trail is cleared before a run, so the previous run's last stage cannot be read as this
+    /// run's progress.
+    func testTheTrailIsResetAtTheStartOfARun() async {
+        let breadcrumbs = RecordingBreadcrumbs()
+        breadcrumbs.record(.qemuInitReturned)
+
+        _ = await makeCoordinator(breadcrumbs: breadcrumbs).run()
+
+        XCTAssertEqual(breadcrumbs.recorded.first, .appLaunch)
+        XCTAssertEqual(breadcrumbs.recorded.filter { $0 == .qemuInitReturned }.count,
+                       0, "a stage from a previous run survived into this one")
+    }
 }

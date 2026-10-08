@@ -144,6 +144,82 @@ fi
 # ------------------------------------------------------- trap protocol
 
 note "trap protocol (assembly)"
+# ---------------------------------------------------------------- the JIT trap path
+#
+# THE SAFETY PROPERTY, as a guard. droidvm_jit_break_get_mapping executes `brk`, and on a device
+# with nothing attached to service it, iOS terminates the process -- EXC_BREAKPOINT, which is what
+# the first physical-device run produced. The host cannot execute an arm64 trap, so what is checked
+# here is ORDER: no path may reach the code that executes the trap without passing the
+# attached-debugger check first.
+#
+# This would have failed before that fix, because there was no check at all.
+JIT_C="engine/native/droidvm_jit.c"
+
+if [ ! -f "$JIT_C" ]; then
+    echo "  FAIL: $JIT_C is missing"
+    fails=$((fails + 1))
+else
+    jit_failed=0
+
+    if grep -q 'static int debugger_is_attached(void)' "$JIT_C"; then
+        echo "  ok:   the attached-debugger check exists"
+    else
+        echo "      FAIL: $JIT_C has no debugger_is_attached()"
+        jit_failed=1
+    fi
+
+    # It must ASK, not TRY. P_TRACED is read from the kernel; anything that executes a trap to
+    # discover whether traps work is the defect this guards against.
+    if grep -q 'P_TRACED' "$JIT_C"; then
+        echo "  ok:   it reads P_TRACED from the kernel rather than attempting a trap"
+    else
+        echo "      FAIL: debugger_is_attached() does not consult P_TRACED"
+        jit_failed=1
+    fi
+
+    # The gate must precede the call that reaches the trap, in BOTH entry points: capture is
+    # reachable directly, and the probe is what the app actually calls first.
+    for fn in droidvm_jit_capture droidvm_jit_probe; do
+        at="$(grep -n "^droidvm_jit_status $fn" "$JIT_C" | head -1 | cut -d: -f1)"
+        if [ -z "$at" ]; then
+            echo "      FAIL: $fn was not found"
+            jit_failed=1
+            continue
+        fi
+
+        gate="$(awk -v s="$at" 'NR > s && /debugger_is_attached\(\)/ { print NR; exit }' "$JIT_C")"
+        if [ -n "$gate" ]; then
+            printf '  ok:   %-20s checks the debugger (line %s)\n' "$fn" "$gate"
+        else
+            echo "      FAIL: $fn does not check whether anything is attached"
+            jit_failed=1
+        fi
+
+        # And in capture the gate must come BEFORE make_views, which is what executes the trap.
+        trap_at="$(awk -v s="$at" 'NR > s && /make_views\(/ { print NR; exit }' "$JIT_C")"
+        if [ -n "$trap_at" ]; then
+            if [ -n "$gate" ] && [ "$gate" -lt "$trap_at" ]; then
+                printf '  ok:   %-20s gate (line %s) precedes the trap (line %s)\n' "$fn" "$gate" "$trap_at"
+            else
+                echo "      FAIL: $fn can reach the trap without the debugger check (gate=${gate:-none} trap=$trap_at)"
+                jit_failed=1
+            fi
+        fi
+    done
+
+    # The probe must never execute the trap itself: it decides what to tell the user.
+    probe_at="$(grep -n '^droidvm_jit_status droidvm_jit_probe' "$JIT_C" | head -1 | cut -d: -f1)"
+    # The BODY only: from the declaration to the function's closing brace at column 0.
+    if [ -n "$probe_at" ] && awk -v s="$probe_at" 'NR > s { if (/^}/) exit; if (/droidvm_jit_break_get_mapping\(\)/) found=1 } END { exit !found }' "$JIT_C"; then
+        echo "      FAIL: droidvm_jit_probe executes the trap itself"
+        jit_failed=1
+    else
+        echo "  ok:   probe never executes the trap itself"
+    fi
+
+    [ "$jit_failed" -eq 0 ] || fails=$((fails + 1))
+fi
+
 ASM="engine/jit/droidvm-brk.S"
 if [ ! -f "$ASM" ]; then
     echo "  FAIL: $ASM is missing"

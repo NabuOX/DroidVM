@@ -88,6 +88,8 @@ public final class EngineRunCoordinator {
     /// decides. Not a second observer: `MetalDisplaySurface` used to report this too, which meant
     /// two detection paths for one fact and two chances to disagree.
     private let noteHostAttachment: ((Bool) -> Void)?
+    /// Where the run records how far it got, so a kill inside a stage is still diagnosable.
+    private let breadcrumbs: StageBreadcrumbRecording?
     private let surface: DisplaySurfaceHandle?
     private let recorder: DiagnosticsRecorder
     private let profile: RuntimeProfile
@@ -112,6 +114,7 @@ public final class EngineRunCoordinator {
                 surface: DisplaySurfaceHandle? = nil,
                 displayTelemetry: (() -> EngineRunReport.DisplayObservation)? = nil,
                 noteHostAttachment: ((Bool) -> Void)? = nil,
+                breadcrumbs: StageBreadcrumbRecording? = nil,
                 profile: RuntimeProfile = RuntimeProfile(),
                 confirmationTimeout: TimeInterval = engineConfirmationTimeout,
                 displayTimeout: TimeInterval = displayAttachmentTimeout,
@@ -126,6 +129,7 @@ public final class EngineRunCoordinator {
         self.surface = surface
         self.displayTelemetry = displayTelemetry
         self.noteHostAttachment = noteHostAttachment
+        self.breadcrumbs = breadcrumbs
         self.profile = profile
         self.recorder = recorder
     }
@@ -178,17 +182,27 @@ public final class EngineRunCoordinator {
 
         report = EngineRunReport()
 
+        // The trail is cleared first so a previous run's last stage cannot be read as this one's.
+        breadcrumbs?.reset()
+        breadcrumbs?.record(.appLaunch)
+
         // Reaching this line IS the app-launch evidence: this code runs inside the app process
         // on the device. Recorded explicitly rather than defaulted, so that a report produced
         // without running anything cannot claim it.
         report.appLaunch = .pass
         report.runtimeController = .pass
 
+        breadcrumbs?.record(.runtimeControllerEntered)
         transition(to: .preparing)
+        breadcrumbs?.record(.runtimeControllerReturned)
 
         // ---- 1. executable memory ------------------------------------------------------
         transition(to: .checkingJIT)
+        // Around the call, not inside it: this is the boundary the first device run died on, and
+        // a trail ending at `jitProbeEntered` names it without needing a crash log.
+        breadcrumbs?.record(.jitProbeEntered)
         let readiness = await jit.prepareRuntime()
+        breadcrumbs?.record(.jitProbeReturned)
 
         switch readiness {
         case .ready:
@@ -222,7 +236,9 @@ public final class EngineRunCoordinator {
         }
 
         // ---- 2. the Swift -> C bridge --------------------------------------------------
+        breadcrumbs?.record(.nativeBridgeEntered)
         let bridgeStatus = await bridge.probe()
+        breadcrumbs?.record(.nativeBridgeReturned)
         report.nativeBridge = bridgeStatus.ok ? .pass : .fail
         guard bridgeStatus.ok else {
             return fail(stage: .nativeBridge,
