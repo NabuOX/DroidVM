@@ -46,6 +46,9 @@ private final class StubEngine: VMEngine, @unchecked Sendable {
 
 private final class StubJIT: JITProvider, @unchecked Sendable {
     var result: RuntimeReadiness = .ready
+    /// What the provider would put in the report's technical field.
+    var technicalDetailValue = ""
+    var technicalDetail: String { technicalDetailValue }
     private(set) var prepareCalls = 0
     private(set) var readiness: RuntimeReadiness = .unknown
 
@@ -750,5 +753,38 @@ final class EngineRunTests: XCTestCase {
         XCTAssertEqual(breadcrumbs.recorded.first, .appLaunch)
         XCTAssertEqual(breadcrumbs.recorded.filter { $0 == .qemuInitReturned }.count,
                        0, "a stage from a previous run survived into this one")
+    }
+
+    /// THE EVIDENCE MUST REACH THE REPORT. The diagnostic build's whole purpose is to return
+    /// provider_raw, the protections, the alias delta and the readback result. `JITManager`
+    /// deliberately hands the caller a short user-facing sentence, so the detailed reason has to
+    /// travel separately -- and if it does not, a device run stops as designed and teaches nothing.
+    func testTheRenderedReportCarriesTheJITTechnicalDetail() async {
+        let jit = StubJIT()
+        jit.result = .failed(reason: "Android's runtime check stopped before running any code.")
+        jit.technicalDetailValue =
+            "diagnostic stop before execution: provider_raw=0x115000000 exec=0x116000000 "
+            + "write=0x117000000 delta=1048576 size=1073741824 match=1"
+
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertTrue(report.rendered.contains("provider_raw="),
+                      "the report dropped the evidence:\n\(report.rendered)")
+        XCTAssertTrue(report.jitReason?.contains("provider_raw=") == true,
+                      "jit_reason dropped the evidence: \(report.jitReason ?? "nil")")
+        // And the user-facing sentence survives alongside it: the evidence does not replace the
+        // explanation a person needs.
+        XCTAssertTrue(report.rendered.contains("Android's runtime check stopped"), report.rendered)
+    }
+
+    /// With no technical detail, the report falls back to the plain reason rather than showing an
+    /// empty field.
+    func testTheReportFallsBackToThePlainReasonWithoutTechnicalDetail() async {
+        let jit = StubJIT()
+        jit.result = .failed(reason: "Android's runtime check stopped before running any code.")
+
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertEqual(report.jitReason, "Android's runtime check stopped before running any code.")
     }
 }

@@ -212,17 +212,21 @@ public final class EngineRunCoordinator {
             // NOT an engine failure, and the wording says so. The environment declined; the
             // engine was never asked. There is nothing to retry from here and nothing broken.
             report.jit = .unavailable
-            report.jitReason = why
+            // `why` is the sentence a person reads; `technicalDetail` is the evidence. Both go in
+            // the report, because a device run whose evidence never arrives has to be repeated.
+            report.jitReason = Self.jitReason(plain: why, detail: jit.technicalDetail)
             return fail(stage: .jit,
                         reason: why,
-                        technical: "runtime unavailable: \(why)")
+                        technical: jit.technicalDetail.isEmpty
+                            ? "runtime unavailable: \(why)" : jit.technicalDetail)
 
         case .failed(let why):
             report.jit = .failed
-            report.jitReason = why
+            report.jitReason = Self.jitReason(plain: why, detail: jit.technicalDetail)
             return fail(stage: .jit,
                         reason: why,
-                        technical: "runtime preparation failed: \(why)")
+                        technical: jit.technicalDetail.isEmpty
+                            ? "runtime preparation failed: \(why)" : jit.technicalDetail)
 
         case .unknown, .preparing:
             // We asked and did not get an answer. Reported as "did not get that far" rather
@@ -409,6 +413,12 @@ public final class EngineRunCoordinator {
         transition(to: .failed(failure))
         finish()
         return report
+    }
+
+    /// The plain sentence, plus the evidence when there is any. Kept as one function so the two
+    /// failure paths cannot drift apart in how they report.
+    private static func jitReason(plain: String, detail: String) -> String {
+        detail.isEmpty ? plain : "\(plain) | \(detail)"
     }
 
     /// Emit the report to the diagnostic stream.

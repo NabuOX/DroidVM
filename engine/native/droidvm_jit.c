@@ -10,8 +10,8 @@
  * and it is asked for it by executing a trap instruction with a command number in x16.
  *
  * The trap itself lives in droidvm-brk.S, which is DroidVM's own assembly. This file is the
- * bookkeeping around it: the status machine, the reason strings, the two-view mapping, and
- * -- most importantly -- the self-test that decides whether the region is actually usable.
+ * bookkeeping around it: the status machine, the reason strings, the two-view mapping, and the
+ * mapping diagnostics that report what the kernel says about every address involved.
  *
  * WHAT IS DELIBERATELY PORTABLE
  *
@@ -28,10 +28,12 @@
  *
  * THE FAILURE MODE THIS EXISTS TO PREVENT
  *
- * A region can be returned that is mapped and still cannot execute. A flag saying "we have
- * executable memory" that is set before something has run in it converts that into a
- * mystery several layers away. So the self-test happens here, before any status other than
- * SELF_TEST_FAILED is possible.
+ * A region can be returned that is mapped and still cannot execute -- and two device runs died
+ * executing exactly such a region. So a flag saying "we have executable memory" is never set
+ * before something has run in it, and nothing runs in it until the mapping contract is proven.
+ *
+ * Capture therefore INSPECTS and stops: it returns DIAGNOSTIC_STOP, never OK, until the evidence
+ * it reports has settled which alias is which.
  */
 
 #include "droidvm_native.h"
@@ -178,20 +180,6 @@ droidvm_jit_status droidvm_jit_probe(void)
     droidvm_jit_set_reason("mechanism available and a debugger is attached; no region held");
     return DROIDVM_JIT_OK;
 }
-
-/* ------------------------------------------------------------------ *
- * The self-test
- *
- * THE POINT OF THIS FILE. A region that is mapped but cannot execute is the failure that
- * looks like success: everything reports fine until something jumps into it, and by then
- * the explanation is several layers away.
- *
- * The test writes a single `ret` and calls it. If the mapping is not executable the call
- * faults; if the write did not reach the executable view, the call returns to the wrong
- * place. Neither is survivable in-process, so on Darwin this runs with the two views
- * established and any failure is caught by the caller's own signal handling -- which is why
- * the ordering below matters and why the flag is set only after everything else.
- * ------------------------------------------------------------------ */
 
 #if defined(__APPLE__) && defined(__arm64__)
 /* The trap's raw return register, recorded by make_views and reported by capture.

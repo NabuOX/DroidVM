@@ -118,6 +118,20 @@ public protocol JITProvider: AnyObject, Sendable {
 
     /// Give the region back, if that is possible for this provider.
     func release() async
+
+    /// The detailed, NON-USER-FACING reason for the last preparation outcome.
+    ///
+    /// `RuntimeReadiness` carries the reason a person should read, which is deliberately short. The
+    /// evidence -- addresses, protections, alias delta, readback bytes -- has to travel separately
+    /// or it is lost, and a device diagnostic whose evidence never reaches the report has collected
+    /// nothing.
+    var technicalDetail: String { get }
+}
+
+public extension JITProvider {
+    /// Empty unless a provider has something detailed to say. A default so conformers that only
+    /// implement the product-facing surface stay valid.
+    var technicalDetail: String { "" }
 }
 
 /// The display path: how guest pixels reach the screen, and what happened on the way.
