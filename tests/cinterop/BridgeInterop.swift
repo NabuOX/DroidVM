@@ -254,11 +254,26 @@ func testCEnumAndJITStatus() {
         case DROIDVM_JIT_SELF_TEST_FAILED: return "self test failed"
         case DROIDVM_JIT_ALREADY_HELD: return "already held"
         case DROIDVM_JIT_UNSUPPORTED: return "unsupported"
+        case DROIDVM_JIT_DIAGNOSTIC_STOP: return "diagnostic stop"
         default: return "other"
         }
     }
     check(describe(DROIDVM_JIT_UNSUPPORTED) == "unsupported",
           "switch dispatches on a C enum")
+
+    // STATUS 6 CROSSES THE ABI, and a wrong mapping would compile and pass every other host test --
+    // then report a deliberate diagnostic stop as an allocation or execution failure on a device.
+    let diagnostic = TrapExecutableMemory.error(for: DROIDVM_JIT_DIAGNOSTIC_STOP)
+    if case .diagnosticStop = diagnostic {
+        check(true, "status 6 maps to a diagnostic stop")
+    } else {
+        check(false, "status 6 did not map to a diagnostic stop: \(diagnostic)")
+    }
+    if case .selfTestFailed = diagnostic {
+        check(false, "status 6 must not claim an execution was attempted")
+    } else {
+        check(true, "status 6 does not claim an execution was attempted")
+    }
 
     // This host genuinely has no executable-memory mechanism, so the platform test must say
     // so rather than claiming availability it cannot honour.

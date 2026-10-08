@@ -136,6 +136,13 @@ public enum ExecutableMemoryError: Error, Equatable {
     /// Already holding a region. Releasing first is required.
     case alreadyHeld(regionBytes: Int)
 
+    /// Diagnostics ran and execution was DELIBERATELY not attempted.
+    ///
+    /// Distinct from `selfTestFailed`, which means a region was mapped and did not execute. This
+    /// one means nothing was executed at all, so reporting it as an execution failure would be
+    /// false -- and a device diagnostic that lies about what it did is worse than no diagnostic.
+    case diagnosticStop(reason: String)
+
     /// A reason suitable for a log. Not for a user.
     public var technicalReason: String {
         switch self {
@@ -144,6 +151,7 @@ public enum ExecutableMemoryError: Error, Equatable {
         case .selfTestFailed(let r): return "execute self-test failed: \(r)"
         case .unsupportedPlatform(let r): return "unsupported platform: \(r)"
         case .alreadyHeld(let n): return "already holding \(n) bytes"
+        case .diagnosticStop(let r): return "diagnostic stop: \(r)"
         }
     }
 
@@ -154,7 +162,7 @@ public enum ExecutableMemoryError: Error, Equatable {
     public var isEnvironmentLimitation: Bool {
         switch self {
         case .notPermitted, .unsupportedPlatform: return true
-        case .allocationFailed, .selfTestFailed, .alreadyHeld: return false
+        case .allocationFailed, .selfTestFailed, .alreadyHeld, .diagnosticStop: return false
         }
     }
 
@@ -167,6 +175,7 @@ public enum ExecutableMemoryError: Error, Equatable {
         case .selfTestFailed: return "Android could not run code in the memory it reserved."
         case .unsupportedPlatform: return "This device is not supported."
         case .alreadyHeld: return "Android is already prepared."
+        case .diagnosticStop: return "Android's runtime check stopped before running any code."
         }
     }
 }

@@ -96,6 +96,12 @@ executable memory the engine's execution path never ran, so there is nothing to 
 | `UNAVAILABLE` | The environment declined. Typically nothing is attached to enable it. **Not a fault and not an engine failure.** | run stops at `checkingJIT`; report `fail`, and say so rather than inventing a pass |
 | `FAILED` | An attempt was made and did not work | run stops; report `fail` with the reason |
 | `NOT RUN` | The provider returned no answer | reported as "did not get that far", never as a refusal |
+| `FAILED` — reason `diagnostic stop: …` | **The diagnostic build working as designed.** It inspected the mapping and stopped before executing anything, on purpose. The reason carries the evidence: `provider_raw`, `exec`, `write`, `delta`, `readback_attempted`, `match`, the bytes written and read back, and a `mach_vm_region` description of each address | run stops; this is NOT an engine or runtime failure, and the reason must be read before concluding anything |
+
+> **The diagnostic build cannot reach `READY`.** It never executes the region, so no self-test can
+> pass and no mapping can be called ready. A `diagnostic stop` in the report is expected on every
+> device run until the alias contract is proven and execution is deliberately restored. Reading it
+> as a failure would be reading a designed stop as a fault.
 
 `UNAVAILABLE` is **not** the same as `FAILED`, and the two are never collapsed: one is an
 environment that will not permit it, the other is something that broke.

@@ -86,16 +86,27 @@ typedef enum droidvm_jit_status {
     DROIDVM_JIT_ALLOCATION_FAILED= 2,
     DROIDVM_JIT_SELF_TEST_FAILED = 3,  /* mapped but cannot execute       */
     DROIDVM_JIT_ALREADY_HELD     = 4,
-    DROIDVM_JIT_UNSUPPORTED      = 5
+    DROIDVM_JIT_UNSUPPORTED      = 5,
+
+    /* Diagnostics ran and execution was DELIBERATELY not attempted.
+     *
+     * A distinct value on purpose. SELF_TEST_FAILED means "mapped but cannot execute", so returning
+     * it here would report an execution failure that never happened -- a false reason, which is the
+     * one thing a device diagnostic must not produce. */
+    DROIDVM_JIT_DIAGNOSTIC_STOP  = 6
 } droidvm_jit_status;
 
 /* Non-destructive availability check. Never traps, never allocates. */
 droidvm_jit_status droidvm_jit_probe(void);
 
-/* Capture a region of at least `bytes`. Returns DROIDVM_JIT_OK and
- * fills `out` on success. Performs an execute self-test before
- * reporting success -- a region that is mapped but cannot execute is
- * the failure mode that is otherwise indistinguishable from working. */
+/* DIAGNOSTIC BUILD: this cannot currently reach DROIDVM_JIT_OK.
+ *
+ * It maps the region, INSPECTS it -- reporting the provider's raw return value and the kernel's
+ * description of every address involved -- and returns DROIDVM_JIT_DIAGNOSTIC_STOP. It executes
+ * nothing, so it does not self-test, does not fill `out`, and never reports a region as ready.
+ *
+ * A stop here is the build WORKING AS DESIGNED, not a runtime failure. The executing self-test
+ * returns once the provider's alias contract is proven from that evidence. */
 droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out);
 
 /* Release the region, if the platform permits it. */

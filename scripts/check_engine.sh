@@ -217,6 +217,85 @@ else
         echo "  ok:   probe never executes the trap itself"
     fi
 
+
+    # ---- diagnostic-build invariants ------------------------------------------------
+    #
+    # The provider's return value is recorded and reported, and must never become a pointer. If it
+    # ever appears beside exec_out, write_out, memcpy, or a function-pointer cast, it has stopped
+    # being evidence and become input -- which is the mistake this build exists to avoid.
+    misuse="$(grep -n 'provider_return_raw' "$JIT_C" \
+              | grep -E 'exec_out|write_out|memcpy|void \(\*' || true)"
+    if [ -z "$misuse" ]; then
+        echo "  ok:   provider_return_raw is never used as a pointer or copied"
+    else
+        echo "      FAIL: provider_return_raw is used as a pointer:"
+        echo "$misuse" | sed 's/^/            /'
+        jit_failed=1
+    fi
+
+    # It must be assigned from the trap, which requires the declaration to return something.
+    if grep -q 'g_provider_return_raw = droidvm_jit_break_get_mapping();' "$JIT_C"; then
+        echo "  ok:   the trap's raw return is captured"
+    else
+        echo "      FAIL: the trap's return is not captured for diagnostics"
+        jit_failed=1
+    fi
+
+    # NO INDIRECT EXECUTION -- checked as a PROPERTY, not by name.
+    #
+    # An earlier version grepped for `fn();`, which any other identifier would have evaded. The
+    # property is that the file contains no function-pointer cast or call at all: without one,
+    # there is nothing to call indirectly, whatever it might have been called.
+    #
+    # Comment lines are stripped first, because prose about function pointers is not one.
+    code_lines="$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C")"
+    indirect="$(printf '%s\n' "$code_lines" \
+                | grep -nE '\([[:space:]]*\*[[:space:]]*[A-Za-z_]|\([[:space:]]*void[[:space:]]*\([[:space:]]*\*' || true)"
+    if [ -z "$indirect" ]; then
+        echo "  ok:   no function-pointer cast or call exists in the diagnostic build"
+    else
+        echo "      FAIL: the diagnostic build can call through a function pointer:"
+        printf '%s\n' "$indirect" | sed 's/^/            /'
+        jit_failed=1
+    fi
+
+    # The self-test that executed must be gone, not merely unused.
+    if grep -q 'static droidvm_jit_status self_test' "$JIT_C"; then
+        echo "      FAIL: the executing self-test is still present"
+        jit_failed=1
+    else
+        echo "  ok:   the executing self-test is gone"
+    fi
+
+    # The read through the executable alias must be gated on the kernel saying it is readable.
+    #
+    # Matching the CONDITIONAL, not two strings that happen to appear elsewhere in the file: an
+    # earlier version stayed green with the guard deleted, which is a check that cannot fail.
+    if grep -q 'exec_prot & VM_PROT_READ' "$JIT_C" \
+       && grep -q 'write_prot & VM_PROT_WRITE' "$JIT_C" \
+       && grep -q 'mach_vm_region' "$JIT_C"; then
+        echo "  ok:   the readback is gated on exec_prot/write_prot from mach_vm_region"
+    else
+        echo "      FAIL: the readback is not gated on the reported protection"
+        jit_failed=1
+    fi
+
+    # And the gap check: a successful mach_vm_region is not proof that the ADDRESS is mapped.
+    if grep -q 'address >= region + region_size' "$JIT_C"; then
+        echo "  ok:   a region answer must contain the address to count as mapped"
+    else
+        echo "      FAIL: a gap could be reported as mapped"
+        jit_failed=1
+    fi
+
+    # marker: not yet ready, and the provider's call is still unused
+    if grep -q 'droidvm_jit_break_mark_executable()' "$JIT_C"; then
+        echo "      FAIL: mark_executable is called before the contract is proven"
+        jit_failed=1
+    else
+        echo "  ok:   mark_executable is still not called (contract unproven)"
+    fi
+
     [ "$jit_failed" -eq 0 ] || fails=$((fails + 1))
 fi
 

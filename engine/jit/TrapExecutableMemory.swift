@@ -95,7 +95,9 @@ public final class TrapExecutableMemory: ExecutableMemoryBackend {
     // limitation or a fault. That distinction is what decides whether the user is told
     // "this device is not supported" or "something went wrong".
 
-    private static func error(for status: droidvm_jit_status) -> ExecutableMemoryError {
+    /// Internal, not private, so the host interop harness can assert the mapping of every status
+    /// value that crosses the C ABI. A mapping mistake here compiles and passes every other test.
+    static func error(for status: droidvm_jit_status) -> ExecutableMemoryError {
         let reason = Self.reason()
         switch status {
         case DROIDVM_JIT_NOT_PERMITTED:
@@ -108,6 +110,10 @@ public final class TrapExecutableMemory: ExecutableMemoryBackend {
             return .alreadyHeld(regionBytes: 0)
         case DROIDVM_JIT_UNSUPPORTED:
             return .unsupportedPlatform(reason: reason)
+        case DROIDVM_JIT_DIAGNOSTIC_STOP:
+            // NOT selfTestFailed: that means "mapped but cannot execute", and claiming an execution
+            // failure for a run that deliberately did not execute is a false reason.
+            return .diagnosticStop(reason: reason)
         default:
             return .allocationFailed(reason: reason)
         }
