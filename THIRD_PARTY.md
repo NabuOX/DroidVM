@@ -146,9 +146,12 @@ The distinction is easy to get wrong, so:
 It ships as a bare Mach-O with no licence file. An unlicensed binary is not something a
 GPL project can take a dependency on. It turned out not to matter: the framework is three
 instruction pairs (`mov x16, #1 ; brk #0xf00d`, the same with `#0`, and `brk #0x69`),
-which are the *protocol* by which a debugger is asked for executable memory. DroidVM will
-issue those traps in its own assembly (see `engine/jit/`), reproducing an interface rather
-than anyone's expression. That is recorded here precisely because it is the kind of
+which are the *protocol* by which a debugger is asked for executable memory. DroidVM issues
+these traps in its own assembly (see `engine/jit/`), reproducing an interface rather
+than anyone's expression. **DroidVM's current universal path issues two of the three: prepare and detach.**
+`brk #0x69` is defined by the protocol but currently unused by DroidVM. No behaviour is
+attributed to it here: it has not been independently verified, and this record does not
+repeat another project's description of it as though it were established. That is recorded here precisely because it is the kind of
 judgement that should not be made silently.
 
 ## Cross-compiled dependencies of the engine

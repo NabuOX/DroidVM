@@ -210,7 +210,7 @@ else
     # The probe must never execute the trap itself: it decides what to tell the user.
     probe_at="$(grep -n '^droidvm_jit_status droidvm_jit_probe' "$JIT_C" | head -1 | cut -d: -f1)"
     # The BODY only: from the declaration to the function's closing brace at column 0.
-    if [ -n "$probe_at" ] && awk -v s="$probe_at" 'NR > s { if (/^}/) exit; if (/droidvm_jit_break_get_mapping\(\)/) found=1 } END { exit !found }' "$JIT_C"; then
+    if [ -n "$probe_at" ] && awk -v s="$probe_at" 'NR > s { if (/^}/) exit; if (/droidvm_jit_break_get_jit_mapping\(/) found=1 } END { exit !found }' "$JIT_C"; then
         echo "      FAIL: droidvm_jit_probe executes the trap itself"
         jit_failed=1
     else
@@ -230,14 +230,6 @@ else
     else
         echo "      FAIL: provider_return_raw is used as a pointer:"
         echo "$misuse" | sed 's/^/            /'
-        jit_failed=1
-    fi
-
-    # It must be assigned from the trap, which requires the declaration to return something.
-    if grep -q 'g_provider_return_raw = droidvm_jit_break_get_mapping();' "$JIT_C"; then
-        echo "  ok:   the trap's raw return is captured"
-    else
-        echo "      FAIL: the trap's return is not captured for diagnostics"
         jit_failed=1
     fi
 
@@ -273,10 +265,10 @@ else
     # earlier version stayed green with the guard deleted, which is a check that cannot fail.
     # The bits are not enough: `DROIDVM_REGION_UNMAPPED` is -1, so every bit test passes for an
     # unmapped address. The sentinel must be excluded first, and this requires it.
-    if grep -q 'exec_prot & VM_PROT_READ' "$JIT_C" \
-       && grep -q 'write_prot & VM_PROT_WRITE' "$JIT_C" \
-       && grep -q 'exec_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
-       && grep -q 'write_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
+    if grep -q 'rx_prot & VM_PROT_READ' "$JIT_C" \
+       && grep -q 'rw_prot & VM_PROT_WRITE' "$JIT_C" \
+       && grep -q 'rx_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
+       && grep -q 'rw_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
        && grep -q 'vm_region_64' "$JIT_C"; then
         echo "  ok:   the readback needs SUCCESSFUL lookups and the right protection bits"
     else
@@ -293,11 +285,162 @@ else
     fi
 
     # marker: not yet ready, and the provider's call is still unused
-    if grep -q 'droidvm_jit_break_mark_executable()' "$JIT_C"; then
+    if grep -q 'mark_executable' "$JIT_C"; then
         echo "      FAIL: mark_executable is called before the contract is proven"
         jit_failed=1
     else
-        echo "  ok:   mark_executable is still not called (contract unproven)"
+        echo "  ok:   0x69 is not wired to a mark-executable call site"
+    fi
+
+    # ------------------------------------------------------------ the 0xf00d argument contract
+    # The protocol takes x0 = addr (NULL for a fresh region) and x1 = len. A wrapper declared with
+    # no parameters passes whatever happens to be in those registers, which is how DroidVM ended up
+    # asking for the wrong branch: the provider never prepared the pages, and executing them faulted.
+    if grep -q 'droidvm_jit_break_get_jit_mapping(void \*addr, size_t len)' "$JIT_C" \
+       && grep -q 'droidvm_jit_break_get_jit_mapping:' engine/jit/droidvm-brk.S; then
+        echo "  ok:   get_jit_mapping is declared and defined with the addr+len contract"
+    else
+        echo "      FAIL: get_jit_mapping does not carry the addr+len argument contract"
+        jit_failed=1
+    fi
+
+    if grep -q 'droidvm_jit_break_get_jit_mapping(NULL, bytes)' "$JIT_C"; then
+        echo "  ok:   the fresh-region request passes x0=NULL and x1=bytes"
+    else
+        echo "      FAIL: the fresh-region request does not pass NULL and the requested length"
+        jit_failed=1
+    fi
+
+    # ------------------------------------------------------------ the executable region is the provider's
+    if [ "$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'vm_allocate(mach_task_self')" -gt 0 ]; then
+        echo "      FAIL: vm_allocate is called in the JIT path; a self-allocated region is never prepared"
+        jit_failed=1
+    else
+        echo "  ok:   vm_allocate is never called: the executable region comes from the provider"
+    fi
+
+    # vm_remap's SOURCE must be the provider's region, otherwise the alias views our own memory.
+    if [ "$(grep -A4 'vm_remap(mach_task_self' "$JIT_C" | grep -c 'mach_task_self(), (vm_address_t)rx,')" -gt 0 ]; then
+        echo "  ok:   the RW alias is remapped from the provider's region"
+    else
+        echo "      FAIL: the RW alias is not remapped from the provider's region"
+        jit_failed=1
+    fi
+
+    # The provider's protection is kept as delivered: we must never vm_protect EXECUTE onto it.
+    # The property is "VM_PROT_EXECUTE is READ, never GRANTED". Matching one literal spelling is not
+    # enough: appending `| VM_PROT_EXECUTE` to a READ|WRITE grant is the exact bug and does not
+    # contain `READ | VM_PROT_EXECUTE`. So: comments stripped, every occurrence must be the single
+    # validation comparison, and no vm_protect line may mention it.
+    execute_granted=0
+    if [ "$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'vm_protect.*VM_PROT_EXECUTE')" -gt 0 ]; then
+        execute_granted=1
+    fi
+    execute_lines=$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'VM_PROT_EXECUTE')
+    execute_validation=$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'rx_prot & VM_PROT_EXECUTE')
+    if [ "$execute_granted" -eq 0 ] && [ "$execute_lines" -eq 1 ] && [ "$execute_validation" -eq 1 ]; then
+        echo "  ok:   EXECUTE is only ever validated, never granted by vm_protect"
+    else
+        echo "      FAIL: EXECUTE is granted or appears outside the single validation (granted=$execute_granted uses=$execute_lines validation=$execute_validation)"
+        jit_failed=1
+    fi
+
+    # ------------------------------------------------------------ 0x69 is a probe, not a command
+    if grep -q 'mark_executable\|break_probe\|0x69' "$JIT_C" engine/jit/droidvm-brk.S; then
+        echo "      FAIL: a third trap command is back; the protocol has exactly two"
+        jit_failed=1
+    else
+        echo "  ok:   the protocol has two commands and no 0x69 anywhere"
+    fi
+
+    # A prototype with no definition links on no platform and fails only where it is compiled --
+    # which is arm64 Apple, the one place this host cannot see. The deletion of a redundant helper
+    # removed region_probe's body while leaving its declaration, and nothing local noticed.
+    # A PROTOTYPE ends `out_size);`. An IMPLEMENTATION ends `out_size)` with `{` on the next line.
+    # Counting the signature alone cannot tell them apart: the prototype's signature is identical, so
+    # two prototypes with no body satisfied the previous version of this check.
+    probe_protos=$(grep -cF 'char *out, size_t out_size);' "$JIT_C" || true)
+    probe_bodies=$(grep -A1 -F 'char *out, size_t out_size)' "$JIT_C" | grep -cF '{' || true)
+    if [ "${probe_bodies:-0}" -ge 1 ]; then
+        echo "  ok:   region_probe has an implementation, not only a declaration (protos=$probe_protos bodies=$probe_bodies)"
+    else
+        echo "      FAIL: region_probe is declared $probe_protos time(s) but has no body -- an Apple-only link error"
+        jit_failed=1
+    fi
+
+    # Review finding 3: the provider's address must be the START of its region. Otherwise the size
+    # below is not the space available from that address, and remapping or freeing that many bytes
+    # from there would cross the end of the mapping.
+    base_check_at="$(grep -n '(uintptr_t)rx != rx_info.base' "$JIT_C" | head -1 | cut -d: -f1)"
+    remap_at="$(grep -n 'vm_remap(mach_task_self' "$JIT_C" | head -1 | cut -d: -f1)"
+    if [ -n "$base_check_at" ] && [ -n "$remap_at" ] && [ "$base_check_at" -lt "$remap_at" ]; then
+        echo "  ok:   the region-base check runs BEFORE the remap that depends on it (line $base_check_at < $remap_at)"
+    else
+        echo "      FAIL: the region-base check is missing or runs after the remap (base=$base_check_at remap=$remap_at)"
+        jit_failed=1
+    fi
+
+    # ONE-SHOT PREPARE, by ordering within capture.
+    #
+    # The provider's region is never freed, so a second prepare would claim another 1 GiB that is
+    # never reclaimed. Within capture the consumed check AND the consume must both come before the
+    # CALL to make_views -- the call is what reaches the trap, and the trap lives in a function
+    # defined above capture, so line order against the trap itself would prove nothing.
+    oneshot_check=$(grep -n 'if (g_prepare_consumed)' "$JIT_C" | head -1 | cut -d: -f1)
+    oneshot_set=$(grep -n 'g_prepare_consumed = 1;' "$JIT_C" | head -1 | cut -d: -f1)
+    oneshot_call=$(grep -n 'make_views(bytes, &executable' "$JIT_C" | head -1 | cut -d: -f1)
+    if [ -n "$oneshot_check" ] && [ -n "$oneshot_set" ] && [ -n "$oneshot_call" ] \
+       && [ "$oneshot_check" -lt "$oneshot_call" ] && [ "$oneshot_set" -lt "$oneshot_call" ]; then
+        echo "  ok:   the prepare is one-shot: check and consume precede the call (check=$oneshot_check set=$oneshot_set call=$oneshot_call)"
+    else
+        echo "      FAIL: a second prepare could be issued (check=$oneshot_check set=$oneshot_set call=$oneshot_call)"
+        jit_failed=1
+    fi
+
+    if grep -q 'return g_prepare_status;' "$JIT_C"; then
+        echo "  ok:   a repeat reports the collected outcome instead of asking again"
+    else
+        echo "      FAIL: a repeat does not report the collected diagnostic outcome"
+        jit_failed=1
+    fi
+
+    # ------------------------------------------------------------ one-shot state at FILE scope
+    # Brace depth is what the compiler sees. A `static` declaration inside a function is legal C and
+    # invisible outside it, so capture would fail to compile -- only on Apple arm64.
+    # The patterns are indentation-agnostic ON PURPOSE: an indented copy inside a function must be
+    # visible to the depth check. And presence is required as well as depth, because asking only
+    # "is anything misplaced" is satisfied by declaring nothing at all -- which does not compile
+    # either, since capture references all three.
+    oneshot_state=$(awk 'BEGIN { d = 0 }
+        /^[[:space:]]*static int g_prepare_consumed;/ { if (d == 0) seen_c = 1; else bad = 1 }
+        /^[[:space:]]*static droidvm_jit_status g_prepare_status/ { if (d == 0) seen_s = 1; else bad = 1 }
+        /^[[:space:]]*static char g_prepare_reason/ { if (d == 0) seen_r = 1; else bad = 1 }
+        { n = gsub(/{/, "{"); m = gsub(/}/, "}"); d += n - m }
+        END { print (seen_c && seen_s && seen_r && !bad) ? 0 : 1 }' "$JIT_C")
+    if [ "${oneshot_state:-1}" -eq 0 ]; then
+        echo "  ok:   the one-shot state is present and at file scope, outside every function"
+    else
+        echo "      FAIL: one-shot state is missing or declared inside a function, so capture cannot see it"
+        jit_failed=1
+    fi
+
+    # ------------------------------------------------------------ first-attempt evidence is preserved
+    repeat_block=$(awk '/if \(g_prepare_consumed\)/{f=1} f{print} f&&/^    }$/{exit}' "$JIT_C")
+    repeat_code=$(printf '%s\n' "$repeat_block" | grep -vE '^[[:space:]]*(/\*|\*|//)')
+    stored=$(printf '%s\n' "$repeat_code" | grep -c 'g_prepare_reason')
+    mutable=$(printf '%s\n' "$repeat_code" | grep -cE '(^|[^_a-zA-Z])g_reason')
+    if [ "${stored:-0}" -ge 1 ] && [ "${mutable:-1}" -eq 0 ]; then
+        echo "  ok:   a repeat reports the stored first-attempt reason, never the mutable g_reason"
+    else
+        echo "      FAIL: a repeat could report the mutable g_reason (stored=$stored mutable=$mutable)"
+        jit_failed=1
+    fi
+
+    if [ "$(grep -c 'snprintf(g_prepare_reason' "$JIT_C")" -ge 2 ]; then
+        echo "  ok:   both first-attempt outcomes store the reason beside the status"
+    else
+        echo "      FAIL: an outcome path stores the status without storing the reason"
+        jit_failed=1
     fi
 
     [ "$jit_failed" -eq 0 ] || fails=$((fails + 1))
@@ -310,7 +453,7 @@ if [ ! -f "$ASM" ]; then
 else
     # Present, exactly once each, and nothing else in the code section.
     asm_failed=0
-    for pair in "mov x16, #0x1" "brk #0xf00d" "mov x16, #0x0" "brk #0x69"; do
+    for pair in "mov x16, #0x1" "brk #0xf00d" "mov x16, #0x0"; do
         count="$(grep -c -F "$pair" "$ASM" || true)"
         printf '  %-20s occurrences: %s\n' "$pair" "$count"
         if [ "$count" -eq 0 ]; then
@@ -329,8 +472,11 @@ else
     fi
 
     total="$(grep -cE '^\s+brk ' "$ASM" || true)"
-    printf '  %-20s total: %s (expected 3)\n' "traps" "$total"
-    [ "$total" -eq 3 ] || { echo "      FAIL: exactly three traps are expected"; asm_failed=1; }
+    printf '  %-20s total: %s (expected 2)\n' "traps" "$total"
+    # DroidVM's SUBSET, not the protocol. The universal protocol defines more than these two;
+    # saying "the protocol has two commands" would state as fact something DroidVM merely does not
+    # implement, and would make this gate reject a valid protocol extension for the wrong reason.
+    [ "$total" -eq 2 ] || { echo "      FAIL: DroidVM implements exactly two universal-protocol wrappers (prepare, detach)"; asm_failed=1; }
 
     [ "$asm_failed" -eq 0 ] || fails=$((fails + 1))
 fi

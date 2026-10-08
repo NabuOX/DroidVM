@@ -8,11 +8,16 @@
 //
 // WHAT THIS IS, AND WHAT IT IS NOT
 //
-// These are three instruction pairs. Executing a `brk` is how a process asks whatever
-// debugger is attached to do something on its behalf, and the command number travels in
-// x16. The debugger's handler returns a prepared region; the mapping is then re-mapped
-// executable by the debugger, and DroidVM makes a writable alias of the same pages so the
-// translator can write what the emulated CPU will execute.
+// These are TWO instruction pairs. Executing a `brk` is how a process asks whatever
+// debugger is attached to do something on its behalf.
+//
+// x16 carries the command. ARGUMENTS ARRIVE IN x0/x1, and the result is written back into x0
+// before the debugger resumes us -- so the trailing `ret` returns it.
+//
+//   x0 = NULL asks for a FRESH region for the provider to allocate. That is the only branch
+//   that gets a region whose pages the provider prepares; handing in an address DroidVM
+//   allocated itself does not, which is why DroidVM now asks for the region rather than
+//   allocating one.
 //
 // This reproduces an *interface* -- the trap immediates and the register command numbers,
 // all of which are documented in the debugger's own published script -- not anybody's
@@ -24,7 +29,6 @@
 //
 //   0xf00d  the customary "map this for me / unmap it" trap. x16 = 1 asks for a mapping,
 //           x16 = 0 releases it.
-//   0x69    marks an existing mapping as executable without going through 0xf00d.
 //
 // Both immediates appear in the debugger's own script, which is why following them is
 // following a protocol rather than copying an implementation.
@@ -34,29 +38,30 @@
 .text
 .align 2
 
-// droidvm_jit_break_get_mapping()
-//   Ask the debugger to prepare a mapping for the JIT region.
-//   x16 = 1 is the "get" command.
-.globl _droidvm_jit_break_get_mapping
-_droidvm_jit_break_get_mapping:
+// void *droidvm_jit_break_get_jit_mapping(void *addr, size_t len)
+//   Ask the provider for an execute-capable region.
+//
+//   x0 = addr: NULL requests a FRESH region, which is the only request the provider prepares.
+//   x1 = len:  the size requested.
+//   x16 = 1 selects "prepare region".
+//
+//   Returns the region address in x0, or 0 on failure. The argument registers are already
+//   where the protocol expects them, so this body only sets the command.
+.globl _droidvm_jit_break_get_jit_mapping
+_droidvm_jit_break_get_jit_mapping:
     mov x16, #0x1
     brk #0xf00d
     ret
 
-// droidvm_jit_break_release_mapping()
-//   Release it. x16 = 0 is the "detach / release" command.
-.globl _droidvm_jit_break_release_mapping
-_droidvm_jit_break_release_mapping:
+// void droidvm_jit_break_detach(void)
+//   Let the provider go. x16 = 0 is the detach command.
+//
+//   The protocol has exactly two commands. A preparation that is never followed by a detach leaves
+//   the debugger's script attached and waiting, so this is called on every exit from the trap path.
+.globl _droidvm_jit_break_detach
+_droidvm_jit_break_detach:
     mov x16, #0x0
     brk #0xf00d
-    ret
-
-// droidvm_jit_break_mark_executable()
-//   Mark an existing mapping executable, without the 0xf00d round trip. Used when a region
-//   was obtained by other means and only needs its permissions changed.
-.globl _droidvm_jit_break_mark_executable
-_droidvm_jit_break_mark_executable:
-    brk #0x69
     ret
 
 #endif

@@ -63,11 +63,11 @@ MPL-2.0 is file-level copyleft and is compatible with the GPL (MPL-2.0 §3.3). T
 is embedded unmodified and its source is public at a pinned tag, which is the corresponding
 source for the binary. Its licence texts ship inside the app bundle.
 
-## The three `brk` instruction pairs
+## The `brk` instruction pairs
 
 `BreakpointJIT.framework` ships as a bare Mach-O with **no licence file anywhere in its
 distribution**, so it cannot be taken as a dependency. It turns out not to matter: the
-framework is three instruction pairs, reproduced here because they are the protocol by
+framework is a small set of instruction pairs, reproduced here because they are the protocol by
 which a debugger is asked for executable memory:
 
 ```
@@ -75,6 +75,15 @@ _BreakGetJITMapping:  mov x16, #0x1 ; brk #0xf00d ; ret
 _BreakJITDetach:      mov x16, #0x0 ; brk #0xf00d ; ret
 _BreakMarkJITMapping: brk #0x69     ; ret
 ```
+
+**The external protocol contains three trap forms. DroidVM's current universal JIT path uses two of
+them:** the prepare form (`x16 = 1`, with the region address or NULL in `x0` and the length in `x1`)
+and the detach form (`x16 = 0`). The third form, `brk #0x69`, is currently unused by DroidVM.
+
+It is written down here rather than deleted, because the protocol does define it and DroidVM does not
+use it. **No behaviour is attributed to it.** DroidVM has not independently verified what it does,
+and this record will not claim otherwise on someone else's word; if a later revision needs it, that
+verification is where the work starts.
 
 What is being reproduced is an *interface* — the trap immediates and the register command
 numbers, all documented in StikDebug's own published JavaScript — not anyone's creative

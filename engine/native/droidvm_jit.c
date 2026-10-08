@@ -62,12 +62,16 @@
  * ------------------------------------------------------------------ */
 
 #if defined(__APPLE__) && defined(__arm64__)
-/* Returns the provider's prepared region in x0, according to droidvm-brk.S: the handler's answer
- * is the function's return value. DECLARED SO IT CAN BE RECORDED, not so it can be used: nothing
- * in this file dereferences it, and the allocation flow ignores it. */
-extern uintptr_t droidvm_jit_break_get_mapping(void);
-extern void droidvm_jit_break_release_mapping(void);
-extern void droidvm_jit_break_mark_executable(void);
+/* THE ARGUMENT CONTRACT, from the protocol.
+ *
+ * x0 = addr: NULL requests a FRESH region for the provider to allocate. Handing in an address we
+ * allocated ourselves is the branch that does NOT get its pages prepared.
+ * x1 = len: the size requested.
+ * The result (the region address, or 0) is written back into x0 before the provider resumes us. */
+extern void *droidvm_jit_break_get_jit_mapping(void *addr, size_t len);
+
+/* The protocol's other command. Every preparation must be followed by one of these. */
+extern void droidvm_jit_break_detach(void);
 #endif
 
 /* ------------------------------------------------------------------ *
@@ -181,12 +185,49 @@ droidvm_jit_status droidvm_jit_probe(void)
 }
 
 #if defined(__APPLE__) && defined(__arm64__)
-/* The trap's raw return register, recorded by make_views and reported by capture.
+/* THE REGION DESCRIPTION BUFFER, the sentinel, and the probe that fills them, are declared here
+ * because make_views uses them and is defined above their definitions. C11 has no implicit
+ * declarations, so an Apple build fails without this -- and only an Apple build sees it, which is
+ * why the host gate stays green while gate 2 fails. */
+#define DROIDVM_DIAG_REGION_LEN 200
+
+/* The three states a region probe can report. UNMAPPED and NO_ACCESS are NOT the same: one means the
+ * kernel has no entry, the other means it has one that grants nothing. Collapsing them would make
+ * "we cannot read this" indistinguishable from "this does not exist". */
+#define DROIDVM_REGION_UNMAPPED  (-1)
+
+typedef struct {
+    int mapped;                 /* 0 when the address is not mapped */
+    int cur_prot;               /* what the region allows NOW */
+    int max_prot;               /* the most it could ever allow -- not the same thing */
+    uintptr_t base;
+    unsigned long long size;
+} droidvm_region_info;
+
+static droidvm_region_info region_probe(const char *label, uintptr_t address,
+                                        char *out, size_t out_size);
+
+/* ONE-SHOT STATE, NOT PERSISTED. FILE SCOPE, beside the other Apple-only declarations -- outside
+ * every function, so both make_views and droidvm_jit_capture can see it. (An earlier revision put
+ * these inside make_views, where `static` made them block-scope: legal C, invisible to capture, and
+ * an undeclared-identifier error that only an Apple build would report.)
  *
- * EVIDENCE ONLY. Nothing in this file dereferences it, and the mapping flow ignores it. It lives at
- * file scope because the function that asks the trap and the function that reports the answer are
- * different functions -- a local could not be seen by the one that needs it. */
-static uintptr_t g_provider_return_raw;
+ * The prepare experiment runs at most once per process. The first attempt consumes it; a later Start
+ * reports the evidence already collected rather than asking for another region that would never be
+ * given back. Being process-local, a relaunch begins a fresh process and allows one fresh attempt.
+ *
+ * The consumed flag is set BEFORE the trap is issued, so every outcome -- a valid region, a NULL
+ * return, a validation failure, a remap failure, a readback failure or the diagnostic stop -- leaves
+ * it consumed. There is no path that could ask twice. */
+static int g_prepare_consumed;
+static droidvm_jit_status g_prepare_status = DROIDVM_JIT_OK;
+
+/* THE FIRST ATTEMPT'S OWN REASON, and nothing else may write it afterwards.
+ *
+ * `g_reason` cannot serve here: it is mutable, and the ordinary probe calls droidvm_jit_set_reason
+ * (which writes it) on every Start before capture runs. Reading `g_reason` on a repeat therefore
+ * reported the probe's message as though it were the collected evidence. */
+static char g_prepare_reason[1024];
 
 /* ARM64: `ret`. One instruction, no operands, no state. */
 static const uint32_t kReturnInstruction = 0xd65f03c0u;
@@ -195,77 +236,105 @@ static droidvm_jit_status make_views(size_t bytes,
                                      void **exec_out,
                                      void **write_out)
 {
-    /* The executable view is created by the debugger, which maps it on our behalf once the
-     * trap has been serviced. What we get back is a region; the writable alias of those
-     * same pages is made here with vm_remap, which is the only supported way to get a
-     * second view of a mapping we do not own. */
-    /* EVIDENCE ONLY. The value is recorded and reported. It is never dereferenced, never used as
-     * exec_out or write_out, never passed to memcpy, and never assumed to be an address. The
-     * mapping below is DroidVM's own allocation, exactly as before. */
-    g_provider_return_raw = droidvm_jit_break_get_mapping();
-
-    vm_address_t base = 0;
-    vm_size_t size = 0;
-
-    /* Ask the kernel for our own executable region. A debugger that has been asked for a
-     * mapping exposes it through the trap's side effects; when it has not, this is where
-     * the attempt fails, and it fails here rather than later. */
-    vm_address_t requested = 0;
-    kern_return_t kr = vm_allocate(mach_task_self(), &requested, (vm_size_t)bytes,
-                                   VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) {
-        droidvm_jit_set_reason("vm_allocate failed (kern_return %d)", (int)kr);
-        return DROIDVM_JIT_ALLOCATION_FAILED;
+    /* ASK THE PROVIDER FOR THE REGION.
+     *
+     * x0 = NULL requests a FRESH region, which is the only request whose pages the provider
+     * prepares. DroidVM used to vm_allocate its own region and never ask -- and a region we allocate
+     * ourselves is exactly the one that does not get prepared, so it ends up with protection bits
+     * and no authorization to execute. */
+    void *rx = droidvm_jit_break_get_jit_mapping(NULL, bytes);
+    if (rx == NULL) {
+        /* A clean failure: the provider declined, or nothing is attached to service the request.
+         * Nothing is executed and nothing is assumed.
+         *
+         * DETACH EVEN HERE. The request was made, so the provider may be holding state for us, and
+         * a script left waiting would make a later attempt behave differently for a reason this run
+         * caused. */
+        droidvm_jit_set_reason("the provider returned no region for a fresh request "
+                               "(x0=NULL, x1=%zu)", bytes);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_NOT_PERMITTED;
     }
-    base = requested;
-    size = (vm_size_t)bytes;
 
-    /* The executable view: the same pages, mapped RX. Removing write permission is what
-     * makes the mapping executable rather than writable, and the split is the whole point. */
-    kr = vm_protect(mach_task_self(), base, size, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), base, size);
-        droidvm_jit_set_reason("vm_protect to RX failed (kern_return %d)", (int)kr);
+    /* The provider's answer is an address CLAIM, not proof. Ask the kernel before using it. */
+    char rx_buf[DROIDVM_DIAG_REGION_LEN];
+    droidvm_region_info rx_info = region_probe("provider_rx", (uintptr_t)rx, rx_buf, sizeof(rx_buf));
+    int rx_prot = rx_info.mapped ? rx_info.cur_prot : DROIDVM_REGION_UNMAPPED;
+
+    if (rx_prot == DROIDVM_REGION_UNMAPPED) {
+        droidvm_jit_set_reason("the provider returned %p, which is not mapped", rx);
+        droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
 
-    /* The writable alias. VM_PROT_READ|VM_PROT_WRITE here, and the two views are distinct
-     * mappings of the same physical pages.
+    /* THE ADDRESS MUST BE THE START OF ITS REGION. `region_probe` describes the whole mapping that
+     * CONTAINS `rx`, so if the provider returned an address in the middle of one, `rx_info.size` is
+     * not the space available from `rx` -- and remapping or deallocating that many bytes from there
+     * would run past the end of the mapping and touch pages that are not ours.
      *
-     * `vm_remap`, not `mach_vm_remap`. Both exist and on arm64 they are the same width, but
-     * they are different families with different headers:
+     * The protocol returns an allocation base, so anything else is a malformed answer and is
+     * refused rather than interpreted. */
+    if ((uintptr_t)rx != rx_info.base) {
+        droidvm_jit_set_reason("the provider returned an address inside a region rather than at its "
+                               "base: provider_rx=%p provider_rx_region_base=%p",
+                               rx, (void *)rx_info.base);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_ALLOCATION_FAILED;
+    }
+    if ((rx_prot & VM_PROT_EXECUTE) == 0) {
+        droidvm_jit_set_reason("the provider returned %p but it is not execute-capable (cur=%d)",
+                               rx, rx_prot);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_NOT_PERMITTED;
+    }
+
+    /* THE RETURNED LENGTH IS CHECKED BEFORE IT IS USED. Handing a shorter region to vm_remap with a
+     * longer length remaps past the end of the provider's allocation, and the failure then arrives
+     * without the size evidence that explains it.
      *
-     *   vm_*        <mach/vm_map.h>     vm_allocate, vm_protect, vm_deallocate, vm_remap
-     *   mach_vm_*   <mach/mach_vm.h>    mach_vm_allocate, mach_vm_remap, ...
-     *
-     * Every other call in this function is the natural-width `vm_*` family, so mixing in one
-     * `mach_vm_*` call was an inconsistency rather than a deliberate choice -- and it did not
-     * compile, because <mach/mach_vm.h> is not included. Using `vm_remap` keeps the function
-     * in one family and needs no additional header. */
-    vm_address_t writable = 0;
+     * Deliberately NOT clamped: this build measures, and a silent clamp hides the very mismatch it
+     * exists to expose. */
+    if (rx_info.size < (unsigned long long)bytes) {
+        droidvm_jit_set_reason("provider region smaller than requested request: "
+                               "requested_bytes=%zu provider_rx_region_size=%llu",
+                               bytes, rx_info.size);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_ALLOCATION_FAILED;
+    }
+
+    /* The writable alias: locally remapped from the PROVIDER'S region, so it is the same physical
+     * pages, and no debugger is involved in creating it -- which is why it would remain valid after
+     * a detach. */
+    vm_address_t rw = 0;
     vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
-    kr = vm_remap(mach_task_self(), &writable, (vm_size_t)size, 0,
-                  VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
-                  mach_task_self(), base, FALSE,
-                  &cur, &max, VM_INHERIT_NONE);
+    kern_return_t kr = vm_remap(mach_task_self(), &rw, (vm_size_t)bytes, /*mask=*/0,
+                                VM_FLAGS_ANYWHERE,
+                                mach_task_self(), (vm_address_t)rx,
+                                /*copy=*/FALSE, &cur, &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), base, size);
-        droidvm_jit_set_reason("vm_remap for the writable alias failed "
-                               "(kern_return %d)", (int)kr);
+        droidvm_jit_set_reason("vm_remap of the provider's region %p failed (kern_return %d)",
+                               rx, (int)kr);
+        droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
-    kr = vm_protect(mach_task_self(), writable, size, FALSE,
+
+    kr = vm_protect(mach_task_self(), rw, (vm_size_t)bytes, /*set_maximum=*/FALSE,
                     VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), writable, size);
-        vm_deallocate(mach_task_self(), base, size);
-        droidvm_jit_set_reason("vm_protect to RW failed (kern_return %d)", (int)kr);
+        vm_deallocate(mach_task_self(), rw, (vm_size_t)bytes);
+        droidvm_jit_set_reason("vm_protect(READ|WRITE) on the alias failed (kern_return %d)",
+                               (int)kr);
+        droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
 
-    *exec_out = (void *)base;
-    *write_out = (void *)writable;
+/* NO vm_protect ON THE RX REGION. Its protection is whatever the provider delivered, and the
+     * authority to execute it comes from the provider having prepared its pages -- not from bits we
+     * could set ourselves. Setting them ourselves is precisely what produced a mapping that read as
+     * READ|EXEC and faulted on its first instruction. */
+
+    *exec_out = rx;
+    *write_out = (void *)rw;
     return DROIDVM_JIT_OK;
 }
 
@@ -277,16 +346,9 @@ static droidvm_jit_status make_views(size_t bytes,
  * contract is proven, the region is INSPECTED rather than entered -- the same write and read-back,
  * without the call.
  *
- * Nothing here dereferences `provider_return_raw`. It is described by the kernel like any other
+ * The provider's returned region is described by the kernel like any other
  * address, which is how a wrong assumption about it is discovered instead of taken on faith.
  * ------------------------------------------------------------------ */
-
-#define DROIDVM_DIAG_REGION_LEN 200
-
-/* The three states a region probe can report. UNMAPPED and NO_ACCESS are NOT the same: one means
- * the kernel has no entry, the other means it has one that grants nothing. Collapsing them would
- * make "we cannot read this" indistinguishable from "this does not exist". */
-#define DROIDVM_REGION_UNMAPPED  (-1)
 
 /* Returns the current protection bits for `address`, or DROIDVM_REGION_UNMAPPED.
  *
@@ -295,11 +357,21 @@ static droidvm_jit_status make_views(size_t bytes,
  *
  * ASKS THE KERNEL, never the memory: `vm_region_64` answers from the task's map, so a bogus or
  * unreadable address is reported rather than faulted on. */
-static int region_probe(const char *label, uintptr_t address, char *out, size_t out_size)
+/* Reports the base and size of the region it found as well as describing it, so the requested size
+ * and the mapping size appear as separate fields in the report. */
+/* ONE kernel lookup, describing the region that contains `address`.
+ *
+ * ASKS THE KERNEL, never the memory: `vm_region_64` answers from the task's map, so a bogus or
+ * hostile address produces a description rather than a fault. */
+static droidvm_region_info region_probe(const char *label, uintptr_t address,
+                                        char *out, size_t out_size)
 {
+    droidvm_region_info result;
+    memset(&result, 0, sizeof(result));
+
     if (address == 0) {
-        snprintf(out, out_size, "%s=0 (no value returned by the trap)", label);
-        return DROIDVM_REGION_UNMAPPED;
+        snprintf(out, out_size, "%s=0 (the provider returned no address)", label);
+        return result;
     }
 
     /* vm_region_64, not mach_vm_region: `mach/mach_vm.h` is a macOS header and the iOS SDK
@@ -317,13 +389,13 @@ static int region_probe(const char *label, uintptr_t address, char *out, size_t 
                                     (vm_region_info_t)&info, &count, &object);
     if (kr != KERN_SUCCESS) {
         snprintf(out, out_size, "%s=%p UNMAPPED (kr=%d)", label, (void *)address, (int)kr);
-        return DROIDVM_REGION_UNMAPPED;
+        return result;
     }
 
-    /* `vm_region_64` answers with the NEXT region when the address falls in a gap, so a
-     * successful return does NOT mean the address is mapped. Requiring it to lie inside the
-     * returned range is what makes this a description of `address` rather than of its neighbour --
-     * and reporting a gap as mapped would be false evidence from the diagnostic itself. */
+    /* `vm_region_64` answers with the NEXT region when the address falls in a gap, so a successful
+     * return does NOT mean the address is mapped. Requiring it to lie inside the returned range is
+     * what makes this a description of `address` rather than of its neighbour -- and reporting a gap
+     * as mapped would be false evidence produced by the diagnostic itself. */
     if ((vm_address_t)address < region ||
         (vm_address_t)address >= region + region_size) {
         snprintf(out, out_size,
@@ -332,7 +404,7 @@ static int region_probe(const char *label, uintptr_t address, char *out, size_t 
         if (object != MACH_PORT_NULL) {
             mach_port_deallocate(mach_task_self(), object);
         }
-        return DROIDVM_REGION_UNMAPPED;
+        return result;
     }
 
     snprintf(out, out_size,
@@ -345,49 +417,48 @@ static int region_probe(const char *label, uintptr_t address, char *out, size_t 
     if (object != MACH_PORT_NULL) {
         mach_port_deallocate(mach_task_self(), object);
     }
-    return (int)info.protection;
+
+    /* maximum protection is NOT the current one: a region can allow RWX while currently permitting
+     * only RX. Reporting the current value in both fields would be a lie in the device evidence. */
+    result.mapped = 1;
+    result.cur_prot = (int)info.protection;
+    result.max_prot = (int)info.max_protection;
+    result.base = (uintptr_t)region;
+    result.size = (unsigned long long)region_size;
+    return result;
 }
 
-static droidvm_jit_status diagnose_views(void *executable, void *writable, size_t bytes,
-                                         uintptr_t provider_return_raw)
+static droidvm_jit_status diagnose_views(void *executable, void *writable, size_t bytes)
 {
-    /* An arm64 `ret` followed by zeros. Written and read back; NEVER EXECUTED.
-     *
-     * Built from kReturnInstruction rather than repeating its bytes: the instruction is defined
-     * once, so the pattern cannot drift from what execution would eventually run. */
+    /* An arm64 `ret` followed by zeros. Written and read back; NEVER EXECUTED. */
     uint8_t pattern[16];
     memset(pattern, 0, sizeof(pattern));
     memcpy(pattern, &kReturnInstruction, sizeof(kReturnInstruction));
 
     uint8_t readback[16];
-    char exec_info[DROIDVM_DIAG_REGION_LEN];
-    char write_info[DROIDVM_DIAG_REGION_LEN];
-    char provider_info[DROIDVM_DIAG_REGION_LEN];
-
     memset(readback, 0, sizeof(readback));
 
-    int exec_prot = region_probe("exec", (uintptr_t)executable, exec_info, sizeof(exec_info));
-    int write_prot = region_probe("write", (uintptr_t)writable, write_info, sizeof(write_info));
+    char rx_info[DROIDVM_DIAG_REGION_LEN];
+    char rw_info[DROIDVM_DIAG_REGION_LEN];
 
-    /* uintptr_t arithmetic, then a signed result: subtracting two pointers that do not point into
-     * one array is undefined behaviour, even when the difference is what we want to report. */
+    /* FIELD NAMES ARE UNAMBIGUOUS ON PURPOSE. An earlier revision printed `size=` for two different
+     * quantities -- the requested size and the mapping size -- and that ambiguity is why a 1 GiB
+     * request and 128 MiB mappings could not be told apart from the report. */
+    droidvm_region_info rx = region_probe("provider_rx", (uintptr_t)executable,
+                                         rx_info, sizeof(rx_info));
+    droidvm_region_info rw = region_probe("rw_alias", (uintptr_t)writable,
+                                         rw_info, sizeof(rw_info));
+
+    int rx_prot = rx.mapped ? rx.cur_prot : DROIDVM_REGION_UNMAPPED;
+    int rw_prot = rw.mapped ? rw.cur_prot : DROIDVM_REGION_UNMAPPED;
+
     int64_t alias_delta = (int64_t)((uintptr_t)writable - (uintptr_t)executable);
 
-    /* Described only. Not dereferenced, not used as a pointer, not assumed to be an address. */
-    region_probe("provider_raw", provider_return_raw, provider_info, sizeof(provider_info));
-
-    /* The read through the executable alias happens ONLY when the kernel says that address is
-     * readable. A mapping described by the log is not the same as one that is mapped, and this is
-     * the check that turns "we assumed" into "we asked". */
-    int match = -1; /* -1 means the comparison was not attempted. */
+    /* Read through the executable alias ONLY when the kernel says that address is readable. */
     int attempted = 0;
-
-    /* BOTH LOOKUPS MUST HAVE SUCCEEDED FIRST. `DROIDVM_REGION_UNMAPPED` is -1, and -1 has every
-     * bit set, so `-1 & VM_PROT_READ` is nonzero -- testing the bits alone would let an unmapped
-     * address pass and send memcpy into memory that is not there. That is the execute-fault crash
-     * this diagnostic exists to avoid, so the sentinel is excluded BEFORE the bits are read. */
-    if (exec_prot != DROIDVM_REGION_UNMAPPED && write_prot != DROIDVM_REGION_UNMAPPED &&
-        (exec_prot & VM_PROT_READ) != 0 && (write_prot & VM_PROT_WRITE) != 0) {
+    int match = -1;
+    if (rx_prot != DROIDVM_REGION_UNMAPPED && rw_prot != DROIDVM_REGION_UNMAPPED &&
+        (rx_prot & VM_PROT_READ) != 0 && (rw_prot & VM_PROT_WRITE) != 0) {
         attempted = 1;
         memcpy(writable, pattern, sizeof(pattern));
         sys_icache_invalidate(executable, sizeof(pattern));
@@ -395,27 +466,37 @@ static droidvm_jit_status diagnose_views(void *executable, void *writable, size_
         match = (memcmp(readback, pattern, sizeof(pattern)) == 0) ? 1 : 0;
     }
 
-    droidvm_jit_set_reason("diagnostic stop before execution: provider_raw=%p "
-                           "exec=%p write=%p delta=%lld size=%zu readback_attempted=%d match=%d "
-                           "wrote=%02x%02x%02x%02x read=%02x%02x%02x%02x || %s || %s || %s",
-                           (void *)provider_return_raw,
-                           executable, writable,
+    droidvm_jit_set_reason("diagnostic stop before execution: "
+                           "requested_bytes=%zu "
+                           "provider_rx=%p "
+                           "provider_rx_region_base=%p "
+                           "provider_rx_region_size=%llu "
+                           "provider_rx_cur_prot=%d "
+                           "provider_rx_max_prot=%d "
+                           "rw_alias=%p "
+                           "rw_region_size=%llu "
+                           "alias_delta=%lld "
+                           "readback_attempted=%d "
+                           "readback_match=%d "
+                           "wrote=%02x%02x%02x%02x "
+                           "read=%02x%02x%02x%02x "
+                           "|| %s || %s",
+                           bytes,
+                           executable,
+                           (void *)rx.base, rx.size, rx.cur_prot, rx.max_prot,
+                           writable, rw.size,
                            (long long)alias_delta,
-                           bytes, attempted, match,
+                           attempted, match,
                            pattern[0], pattern[1], pattern[2], pattern[3],
                            readback[0], readback[1], readback[2], readback[3],
-                           exec_info, write_info, provider_info);
+                           rx_info, rw_info);
 
     /* A controlled stop, never a crash, and NOT an execution failure: execution was deliberately
-     * not attempted. Saying "self-test failed" here would be a lie the Swift layer repeats. */
+     * not attempted. */
     return DROIDVM_JIT_DIAGNOSTIC_STOP;
 }
 
 #endif /* __APPLE__ && __arm64__ */
-
-/* ------------------------------------------------------------------ *
- * Capture
- * ------------------------------------------------------------------ */
 
 droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
 {
@@ -447,14 +528,29 @@ droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
         return DROIDVM_JIT_NOT_PERMITTED;
     }
 
+    /* THE ONE-SHOT CHECK COMES BEFORE THE TRAP, and so does the flag that consumes it. Anything
+     * that ran the prepare already reported its evidence; asking again would claim another region
+     * that is never released. */
+    if (g_prepare_consumed) {
+        /* g_prepare_reason, NOT g_reason. The probe has almost certainly overwritten g_reason by
+         * now, and reporting that as the first attempt's evidence would hide exactly what the
+         * device run was for. */
+        droidvm_jit_set_reason("the one-shot diagnostic already ran in this process; reporting the "
+                               "evidence it collected rather than asking the provider for another "
+                               "region: %s", g_prepare_reason);
+        return g_prepare_status;
+    }
+    g_prepare_consumed = 1;
+
     void *executable = NULL;
     void *writable = NULL;
     droidvm_jit_status status = make_views(bytes, &executable, &writable);
     if (status != DROIDVM_JIT_OK) {
-        /* make_views executes the get-mapping trap BEFORE it allocates, so provider state may exist
-         * even though the local mapping failed. Releasing only on the success path would let a
-         * retry inherit the previous attempt's mapping and fail for a reason this run caused. */
-        droidvm_jit_break_release_mapping();
+        g_prepare_status = status;
+        snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
+        /* make_views runs the prepare trap BEFORE it can fail, so provider state may exist even
+         * though we obtained nothing usable -- and make_views detaches and deallocates on each of
+         * its own failure paths. Nothing is left for this branch to release. */
         return status;
     }
 
@@ -467,17 +563,24 @@ droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
      * The success path (set `g_held`, fill `*out`, return OK) returns when the alias contract is
      * proven from the device evidence this function produces -- as a decision backed by data, not
      * as a line left lying around. */
-    status = diagnose_views(executable, writable, bytes, g_provider_return_raw);
-    vm_deallocate(mach_task_self(), (vm_address_t)executable, (vm_size_t)bytes);
-    vm_deallocate(mach_task_self(), (vm_address_t)writable, (vm_size_t)bytes);
+    status = diagnose_views(executable, writable, bytes);
+    g_prepare_status = status;
+    snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
 
-    /* Give the provider's mapping back before returning. We asked for it and never used it, and a
-     * diagnostic that runs on every device test must not accumulate provider state: the next
-     * attempt would then fail for a reason the previous one caused.
+    /* GET OUT CLEANLY, FREEING ONLY WHAT IS OURS.
      *
-     * Safe here because this is behind the attached-debugger gate, so the trap has a responder --
-     * and it is a command, not an execution. */
-    droidvm_jit_break_release_mapping();
+     * The writable alias was created here by vm_remap, so it is DroidVM's to release and it is
+     * released.
+     *
+     * The provider's region is NOT released. It was created by the external JIT provider and there
+     * is no proven ownership contract that says DroidVM may unmap it -- while `region_probe` reports
+     * the size of the whole VM region CONTAINING the address, so freeing that many bytes could unmap
+     * memory that is not part of the allocation at all. Its lifetime is therefore left to process
+     * termination in this diagnostic build, which is the safe choice while the contract is unproven.
+     *
+     * The detach is unconditional: the debugger's script must not be left waiting. */
+    vm_deallocate(mach_task_self(), (vm_address_t)writable, (vm_size_t)bytes);
+    droidvm_jit_break_detach();
 
     return status;
 
@@ -501,10 +604,17 @@ droidvm_jit_status droidvm_jit_release(void)
     }
 
 #if defined(__APPLE__) && defined(__arm64__)
-    /* Ask the debugger to release its side first, then drop our own two views. */
-    droidvm_jit_break_release_mapping();
+    /* RELEASE TOUCHES ONLY WHAT DROIDVM OWNS, AND ISSUES NO TRAP.
+     *
+     * There is deliberately no detach here. Detaching belongs to a serviced prepare attempt, and it
+     * happens on every exit from that attempt. By the time a region is held, the provider has
+     * already been told to let go -- so a detach at this point would be a `brk` with no script
+     * attached to service it, which does not fail politely: it terminates the process.
+     *
+     * `g_region.executable` is the PROVIDER's region and is not freed either: its ownership contract
+     * is unproven, and the reported size is the whole containing VM region. Only the writable alias,
+     * which DroidVM created with vm_remap, is released. */
     vm_deallocate(mach_task_self(), (vm_address_t)g_region.writable, (vm_size_t)g_region.size);
-    vm_deallocate(mach_task_self(), (vm_address_t)g_region.executable, (vm_size_t)g_region.size);
 #endif
 
     g_region.executable = NULL;

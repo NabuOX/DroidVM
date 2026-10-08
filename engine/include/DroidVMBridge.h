@@ -101,9 +101,14 @@ droidvm_jit_status droidvm_jit_probe(void);
 
 /* DIAGNOSTIC BUILD: this cannot currently reach DROIDVM_JIT_OK.
  *
- * It maps the region, INSPECTS it -- reporting the provider's raw return value and the kernel's
- * description of every address involved -- and returns DROIDVM_JIT_DIAGNOSTIC_STOP. It executes
- * nothing, so it does not self-test, does not fill `out`, and never reports a region as ready.
+ * It asks the provider for the executable region, INSPECTS it -- reporting the provider-returned
+ * RX address and the kernel's description of every address involved -- and returns
+ * DROIDVM_JIT_DIAGNOSTIC_STOP. It executes nothing, so it does not self-test, does not fill `out`,
+ * and never reports a region as ready.
+ *
+ * The provider's region is deliberately NOT released: no ownership contract for it is proven yet,
+ * so its lifetime is left to process termination rather than risk unmapping memory DroidVM does not
+ * own. The local writable alias, which DroidVM does create, is released on every path.
  *
  * A stop here is the build WORKING AS DESIGNED, not a runtime failure. The executing self-test
  * returns once the provider's alias contract is proven from that evidence. */
