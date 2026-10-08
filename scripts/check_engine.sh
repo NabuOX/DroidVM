@@ -277,7 +277,7 @@ else
        && grep -q 'write_prot & VM_PROT_WRITE' "$JIT_C" \
        && grep -q 'exec_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
        && grep -q 'write_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
-       && grep -q 'mach_vm_region' "$JIT_C"; then
+       && grep -q 'vm_region_64' "$JIT_C"; then
         echo "  ok:   the readback needs SUCCESSFUL lookups and the right protection bits"
     else
         echo "      FAIL: an unmapped address could pass the readback guard (-1 has every bit set)"

@@ -45,7 +45,6 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <sys/mman.h>
@@ -294,7 +293,7 @@ static droidvm_jit_status make_views(size_t bytes,
  * The distinction that matters: a region mapped with VM_PROT_NONE returns 0, which is a real
  * answer, while an address with no region at all returns -1. Callers must not treat 0 as absent.
  *
- * ASKS THE KERNEL, never the memory: `mach_vm_region` answers from the task's map, so a bogus or
+ * ASKS THE KERNEL, never the memory: `vm_region_64` answers from the task's map, so a bogus or
  * unreadable address is reported rather than faulted on. */
 static int region_probe(const char *label, uintptr_t address, char *out, size_t out_size)
 {
@@ -303,30 +302,32 @@ static int region_probe(const char *label, uintptr_t address, char *out, size_t 
         return DROIDVM_REGION_UNMAPPED;
     }
 
-    mach_vm_address_t region = (mach_vm_address_t)address;
-    mach_vm_size_t region_size = 0;
+    /* vm_region_64, not mach_vm_region: `mach/mach_vm.h` is a macOS header and the iOS SDK
+     * rejects it outright. Everything else in this file is the vm_* family for the same reason. */
+    vm_address_t region = (vm_address_t)address;
+    vm_size_t region_size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
 
     memset(&info, 0, sizeof(info));
 
-    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &region_size,
-                                      VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &count, &object);
+    kern_return_t kr = vm_region_64(mach_task_self(), &region, &region_size,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &count, &object);
     if (kr != KERN_SUCCESS) {
         snprintf(out, out_size, "%s=%p UNMAPPED (kr=%d)", label, (void *)address, (int)kr);
         return DROIDVM_REGION_UNMAPPED;
     }
 
-    /* `mach_vm_region` answers with the NEXT region when the address falls in a gap, so a
+    /* `vm_region_64` answers with the NEXT region when the address falls in a gap, so a
      * successful return does NOT mean the address is mapped. Requiring it to lie inside the
      * returned range is what makes this a description of `address` rather than of its neighbour --
      * and reporting a gap as mapped would be false evidence from the diagnostic itself. */
-    if ((mach_vm_address_t)address < region ||
-        (mach_vm_address_t)address >= region + region_size) {
+    if ((vm_address_t)address < region ||
+        (vm_address_t)address >= region + region_size) {
         snprintf(out, out_size,
-                 "%s=%p UNMAPPED (in a gap; mach_vm_region returned the next region at %p)",
+                 "%s=%p UNMAPPED (in a gap; vm_region_64 returned the next region at %p)",
                  label, (void *)address, (void *)region);
         if (object != MACH_PORT_NULL) {
             mach_port_deallocate(mach_task_self(), object);
