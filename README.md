@@ -14,6 +14,12 @@ required of the user.
 > but have never been compiled, linked or run — they need a macOS runner and a device.
 > See the status table below and [docs/roadmap.md](docs/roadmap.md).
 
+## Download test IPA
+
+Current device-test build: **[Download DroidVM IPA (commit `3d2a233`)](https://github.com/NabuOX/DroidVM/actions/runs/37701349873/artifacts/11520325351)**
+
+This is an unsigned test IPA and must be re-signed by your sideloading/installation tool before installation.
+
 ## What DroidVM is
 
 A consumer iOS app that runs a real Android system in a virtual machine and presents it
