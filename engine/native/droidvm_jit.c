@@ -38,10 +38,14 @@
 
 #include "droidvm_native.h"
 
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -82,6 +86,26 @@ extern void droidvm_jit_break_detach(void);
  * limitation. A second capture is refused rather than silently leaking the first. */
 static droidvm_jit_region g_region;
 static int g_held = 0;
+
+/* Set when the held region is given back. `droidvm_jit_release` lives outside the Apple-only block
+ * and reads it, so it is declared here rather than beside the bring-up state. */
+static int g_region_released;
+
+/* The bring-up stages, zero-initialised: on a platform that never runs the pipeline, every stage
+ * reads as not_run, which is exactly true. Declared outside the Apple-only block because the host
+ * gate links this file and the manifest requires the symbol. */
+static droidvm_bringup_report g_bringup = {
+    /* not_run = 1 for every stage: in this ABI "untouched" and "attempted and failed" are different
+     * facts, and a zero-initialised struct would report all five as FAILED before anything ran. */
+    .provider_prepare = { 1, 0 }, .provider_range = { 1, 0 }, .rw_alias = { 1, 0 },
+    .readback = { 1, 0 }, .jit_selftest = { 1, 0 }
+};
+
+void droidvm_jit_bringup_report_get(droidvm_bringup_report *out)
+{
+    if (out == NULL) { return; }
+    *out = g_bringup;
+}
 
 
 /* Large enough for the mapping diagnostic, which is the entire point of the diagnostic build.
@@ -232,9 +256,213 @@ static char g_prepare_reason[1024];
 /* ARM64: `ret`. One instruction, no operands, no state. */
 static const uint32_t kReturnInstruction = 0xd65f03c0u;
 
+/* ---------------------------------------------------------------- bounded range walking
+ *
+ * WHY THIS EXISTS. A 1 GiB request came back with a FIRST region of 16 KiB, and the previous build
+ * treated that as "the provider returned less than we asked for" and stopped. The provider returns a
+ * RANGE assembled from many VM regions, so the usable size is something to MEASURE, not to presume
+ * from one observation.
+ */
+typedef struct {
+    uintptr_t start;
+    unsigned long long requested;
+    unsigned long long first_region_size;
+    unsigned long long contiguous;      /* proven usable from `start` */
+    unsigned int regions_walked;
+    int range_complete;                 /* contiguous == requested */
+    int first_gap_offset;               /* -1 when the range is complete */
+    int gap_reason;                     /* 0 none, 1 unmapped, 2 not executable, 3 limit */
+    int first_cur_prot, first_max_prot, last_cur_prot;
+    int walk_truncated;
+} droidvm_rx_range;
+
+static uint64_t droidvm_now_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* Walks forward from `start`, region by region, while each region is executable and begins exactly
+ * where the previous one ended. BOUNDED TWICE: a fixed region cap and a wall-clock cap, so a
+ * pathological map cannot spin this loop. Stops at the requested length. */
+static void droidvm_walk_provider_range(uintptr_t start, unsigned long long requested,
+                                        droidvm_rx_range *out)
+{
+    enum { kMaxRegions = 4096, kBudgetMs = 250 };
+    char buf[DROIDVM_DIAG_REGION_LEN];
+
+    memset(out, 0, sizeof(*out));
+    out->start = start;
+    out->requested = requested;
+    out->first_gap_offset = -1;
+
+    const uint64_t deadline = droidvm_now_ms() + kBudgetMs;
+    uintptr_t cursor = start;
+    unsigned long long proven = 0;
+
+    while (out->regions_walked < kMaxRegions) {
+        if (proven >= requested) { out->range_complete = 1; break; }
+        if (droidvm_now_ms() > deadline) {
+            out->walk_truncated = 1; out->gap_reason = 3;
+            out->first_gap_offset = (int)proven;
+            break;
+        }
+
+        droidvm_region_info ri = region_probe("range", cursor, buf, sizeof(buf));
+        if (!ri.mapped) {
+            out->gap_reason = 1; out->first_gap_offset = (int)proven; break;
+        }
+        /* A region that does not START at the cursor means the walk has stepped over a gap: the
+         * kernel answers with the NEXT region when an address is unmapped. */
+        if (cursor != ri.base) {
+            out->gap_reason = 1; out->first_gap_offset = (int)proven; break;
+        }
+        /* BOTH BITS. An execute-only mapping would pass an EXECUTE-only test and then be READ by
+         * the readback -- before any fault guard is armed, because the guard belongs to the
+         * self-test. Requiring READ here is what keeps the readback from being the crash. */
+        if ((ri.cur_prot & VM_PROT_EXECUTE) == 0 || (ri.cur_prot & VM_PROT_READ) == 0) {
+            out->gap_reason = 2; out->first_gap_offset = (int)proven; break;
+        }
+
+        if (out->regions_walked == 0) {
+            out->first_region_size = ri.size;
+            out->first_cur_prot = ri.cur_prot;
+            out->first_max_prot = ri.max_prot;
+        }
+        out->last_cur_prot = ri.cur_prot;
+        out->regions_walked++;
+
+        unsigned long long take = ri.size;
+        if (take > requested - proven) { take = requested - proven; }
+        proven += take;
+        cursor += (uintptr_t)take;
+    }
+    out->contiguous = proven;
+}
+
+/* ---------------------------------------------------------------- the execution self-test
+ *
+ * THE ONLY PLACE THIS BUILD EXECUTES JIT MEMORY. It runs one four-instruction stub that returns the
+ * constant 42 -- written through the RW alias, read back through RX, verified byte for byte, and
+ * only then called.
+ *
+ * The signal guard exists so a fault is REPORTED rather than fatal, and it is deliberately narrow:
+ * armed only around this call, and it restores the default disposition and re-raises for any signal
+ * that arrives outside that window, so a genuine crash stays a crash.
+ */
+static sigjmp_buf g_selftest_jmp;
+static volatile sig_atomic_t g_selftest_armed;
+static uintptr_t g_selftest_thread;
+
+/* THE GUARD BELONGS TO ONE THREAD. These handlers are process-wide, so a fault on any other thread
+ * would otherwise longjmp into THIS thread's saved context -- undefined control flow in place of the
+ * crash that actually happened. Only the thread that armed the guard is recovered; everything else
+ * has its default disposition restored and is re-raised. */
+static void droidvm_selftest_signal(int sig)
+{
+    if (g_selftest_armed && (uintptr_t)pthread_self() == g_selftest_thread) {
+        g_selftest_armed = 0;
+        siglongjmp(g_selftest_jmp, sig);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+typedef int (*droidvm_selftest_fn)(void);
+
+/* mov w0, #42 ; ret ; nop ; nop -- the smallest thing that can prove a range executes and that we
+ * can read a result back out of it. */
+static const uint32_t kStub[4] = { 0x52800540u, 0xd65f03c0u, 0xd503201fu, 0xd503201fu };
+
+/* PHASE 4 -- write a known instruction sequence through the alias, read it back through the
+ * executable view, and require an exact match. Nothing is executed here. */
+static droidvm_jit_status verify_readback(void *rx, void *rw, size_t usable)
+{
+    const size_t stub_bytes = sizeof(kStub);
+
+    if (usable < stub_bytes) {
+        droidvm_jit_set_reason("readback: usable range is %zu bytes, too small for the stub",
+                               usable);
+        return DROIDVM_JIT_SELF_TEST_FAILED;
+    }
+
+    memcpy(rw, kStub, stub_bytes);
+    sys_icache_invalidate(rx, stub_bytes);
+
+    if (memcmp(rx, kStub, stub_bytes) != 0) {
+        droidvm_jit_set_reason("readback: the %zu bytes written through rw_alias did not read back "
+                               "through provider_rx", stub_bytes);
+        return DROIDVM_JIT_SELF_TEST_FAILED;
+    }
+    return DROIDVM_JIT_OK;
+}
+
+/* PHASE 5 -- THE ONLY EXECUTION IN THIS BUILD.
+ *
+ * The bytes were already written and verified through both views by verify_readback, so this does
+ * NOT repeat that work: a second readback path would be a second thing to keep correct, and the
+ * reviewer was right that it had become one. The guard is armed BEFORE the call and only for the
+ * calling thread. */
+static droidvm_jit_status run_self_test(void *rx)
+{
+    struct sigaction sa, old_segv, old_bus, old_ill;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = 0;                       /* sa_handler, not SA_SIGINFO: the form must match */
+    sa.sa_handler = droidvm_selftest_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    sigaction(SIGILL, &sa, &old_ill);
+
+    g_selftest_thread = (uintptr_t)pthread_self();
+    int fault = sigsetjmp(g_selftest_jmp, 1);
+    droidvm_jit_status result;
+
+    if (fault == 0) {
+        g_selftest_armed = 1;
+        droidvm_selftest_fn fn = (droidvm_selftest_fn)rx;   /* THE ONE PERMITTED CALL */
+        int returned = fn();
+        g_selftest_armed = 0;
+
+        if (returned == 42) {
+            result = DROIDVM_JIT_OK;
+        } else {
+            droidvm_jit_set_reason("jit_selftest: the stub returned %d, expected 42", returned);
+            result = DROIDVM_JIT_SELF_TEST_FAILED;
+        }
+    } else {
+        g_selftest_armed = 0;
+        droidvm_jit_set_reason("jit_selftest: executing the stub raised signal %d "
+                               "(the range is mapped READ|EXECUTE but did not execute)", fault);
+        result = DROIDVM_JIT_SELF_TEST_FAILED;
+    }
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGILL, &old_ill, NULL);
+    return result;
+}
+
+/* The measured range, kept for the report whether the run succeeds or fails. */
+static droidvm_rx_range g_range;
+static size_t g_usable;
+
+/* Stage recorder. Each stage is marked the moment it is decided, so a later failure cannot erase the
+ * evidence that an earlier one passed. The RECORDER lives here because only this block calls it; the
+ * storage and the getter are portable (see below). */
+static void bringup_mark(droidvm_bringup_stage *stage, int passed)
+{
+    stage->not_run = 0;
+    stage->passed = passed;
+}
+
 static droidvm_jit_status make_views(size_t bytes,
                                      void **exec_out,
-                                     void **write_out)
+                                     void **write_out,
+                                     size_t *usable_out)
 {
     /* ASK THE PROVIDER FOR THE REGION.
      *
@@ -242,8 +470,11 @@ static droidvm_jit_status make_views(size_t bytes,
      * prepares. DroidVM used to vm_allocate its own region and never ask -- and a region we allocate
      * ourselves is exactly the one that does not get prepared, so it ends up with protection bits
      * and no authorization to execute. */
+    g_bringup.requested_bytes = (unsigned long long)bytes;
+
     void *rx = droidvm_jit_break_get_jit_mapping(NULL, bytes);
     if (rx == NULL) {
+        bringup_mark(&g_bringup.provider_prepare, 0);
         /* A clean failure: the provider declined, or nothing is attached to service the request.
          * Nothing is executed and nothing is assumed.
          *
@@ -288,53 +519,118 @@ static droidvm_jit_status make_views(size_t bytes,
         return DROIDVM_JIT_NOT_PERMITTED;
     }
 
-    /* THE RETURNED LENGTH IS CHECKED BEFORE IT IS USED. Handing a shorter region to vm_remap with a
-     * longer length remaps past the end of the provider's allocation, and the failure then arrives
-     * without the size evidence that explains it.
-     *
-     * Deliberately NOT clamped: this build measures, and a silent clamp hides the very mismatch it
-     * exists to expose. */
-    if (rx_info.size < (unsigned long long)bytes) {
-        droidvm_jit_set_reason("provider region smaller than requested request: "
-                               "requested_bytes=%zu provider_rx_region_size=%llu",
-                               bytes, rx_info.size);
+    /* THE ADDRESS MUST BE THE START OF ITS REGION -- otherwise the walk below would begin in the
+     * middle of a mapping and `size` would not be the space available from `rx`. The protocol returns
+     * an allocation base, so anything else is malformed and is refused rather than interpreted. */
+    if ((uintptr_t)rx != rx_info.base) {
+        droidvm_jit_set_reason("provider_prepare: the provider returned an address inside a region "
+                               "rather than at its base: provider_rx=%p provider_rx_region_base=%p",
+                               rx, (void *)rx_info.base);
         droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
+    if ((rx_prot & VM_PROT_EXECUTE) == 0) {
+        droidvm_jit_set_reason("provider_prepare: the provider returned %p but it is not "
+                               "execute-capable (cur=%d)", rx, rx_prot);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_NOT_PERMITTED;
+    }
 
-    /* The writable alias: locally remapped from the PROVIDER'S region, so it is the same physical
-     * pages, and no debugger is involved in creating it -- which is why it would remain valid after
-     * a detach. */
+    /* MEASURE THE RANGE INSTEAD OF PRESUMING IT.
+     *
+     * One vm_region_64 answer describes ONE region. The first one being 16 KiB does not mean the
+     * allocation is 16 KiB; it means the provider assembles the range from many regions. Walking
+     * forward is what turns that into a number we can actually use -- and the walk is bounded, so a
+     * pathological map cannot spin here. */
+    droidvm_rx_range range;
+    droidvm_walk_provider_range((uintptr_t)rx, (unsigned long long)bytes, &range);
+
+    unsigned long long usable = range.contiguous;
+
+    /* Record the measurement FIRST, so it is in the report whichever way this goes. */
+    g_range = range;
+    g_bringup.contiguous_rx_bytes = range.contiguous;
+    g_bringup.first_region_size = range.first_region_size;
+    g_bringup.regions_walked = range.regions_walked;
+    g_bringup.range_complete = range.range_complete;
+    g_bringup.first_gap_offset = range.first_gap_offset;
+    g_bringup.gap_reason = range.gap_reason;
+    g_bringup.rx_cur_prot = range.first_cur_prot;
+    g_bringup.rx_max_prot = range.first_max_prot;
+    bringup_mark(&g_bringup.provider_prepare, 1);
+
+    if (usable == 0) {
+        bringup_mark(&g_bringup.provider_range, 0);
+        droidvm_jit_set_reason("provider_range: no executable range begins at provider_rx=%p "
+                               "(gap_reason=%d regions_walked=%u)",
+                               rx, range.gap_reason, range.regions_walked);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_NOT_PERMITTED;
+    }
+
+    /* A PARTIAL RANGE IS NOT A SMALLER SUCCESS.
+     *
+     * `acquire(bytes:)` promises at least `bytes`. A prefix that merely executes -- 16 KiB of a 1 GiB
+     * request -- would run the stub happily and report READY for a region the engine could never use,
+     * so `usable > 0` is NOT sufficient: the measurement has to cover the request.
+     *
+     * Checked BEFORE the alias exists, and therefore before rw_alias, readback, jit_selftest and
+     * READY. A truncated walk lands here too: stopping early is a reason to refuse, not a reason to
+     * settle for less. */
+    if (!range.range_complete) {
+        bringup_mark(&g_bringup.provider_range, 0);
+        droidvm_jit_set_reason("provider_range: the provider's range covers only "
+                               "contiguous_rx_bytes=%llu of requested_bytes=%zu "
+                               "range_complete=0 (regions_walked=%u first_region_size=%llu "
+                               "gap_reason=%d first_gap_offset=%d walk_truncated=%d); "
+                               "a partial range cannot satisfy the request",
+                               range.contiguous, bytes,
+                               range.regions_walked, range.first_region_size,
+                               range.gap_reason, range.first_gap_offset, range.walk_truncated);
+        droidvm_jit_break_detach();
+        return DROIDVM_JIT_ALLOCATION_FAILED;
+    }
+    bringup_mark(&g_bringup.provider_range, 1);
+
+    g_bringup.usable_bytes = usable;
+
+    /* THE ALIAS COVERS ONLY THE PROVEN RANGE. Aliasing `bytes` when only `usable` was proven would
+     * remap past the end of the provider's allocation. */
     vm_address_t rw = 0;
     vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
-    kern_return_t kr = vm_remap(mach_task_self(), &rw, (vm_size_t)bytes, /*mask=*/0,
+    kern_return_t kr = vm_remap(mach_task_self(), &rw, (vm_size_t)usable, /*mask=*/0,
                                 VM_FLAGS_ANYWHERE,
                                 mach_task_self(), (vm_address_t)rx,
                                 /*copy=*/FALSE, &cur, &max, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-        droidvm_jit_set_reason("vm_remap of the provider's region %p failed (kern_return %d)",
-                               rx, (int)kr);
+        bringup_mark(&g_bringup.rw_alias, 0);
+        droidvm_jit_set_reason("rw_alias: vm_remap of the proven range %p (%llu bytes) failed "
+                               "(kern_return %d)", rx, usable, (int)kr);
         droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
 
-    kr = vm_protect(mach_task_self(), rw, (vm_size_t)bytes, /*set_maximum=*/FALSE,
+    kr = vm_protect(mach_task_self(), rw, (vm_size_t)usable, /*set_maximum=*/FALSE,
                     VM_PROT_READ | VM_PROT_WRITE);
     if (kr != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), rw, (vm_size_t)bytes);
-        droidvm_jit_set_reason("vm_protect(READ|WRITE) on the alias failed (kern_return %d)",
-                               (int)kr);
+        vm_deallocate(mach_task_self(), rw, (vm_size_t)usable);
+        bringup_mark(&g_bringup.rw_alias, 0);
+        droidvm_jit_set_reason("rw_alias: vm_protect(READ|WRITE) failed (kern_return %d)", (int)kr);
         droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }
 
-/* NO vm_protect ON THE RX REGION. Its protection is whatever the provider delivered, and the
+    /* NO vm_protect ON THE RX REGION. Its protection is whatever the provider delivered, and the
      * authority to execute it comes from the provider having prepared its pages -- not from bits we
-     * could set ourselves. Setting them ourselves is precisely what produced a mapping that read as
-     * READ|EXEC and faulted on its first instruction. */
+     * could set ourselves. Setting them ourselves is what produced a mapping that read as
+     * READ|EXECUTE and faulted on its first instruction. W^X holds: RX stays READ|EXECUTE as
+     * delivered, the alias is READ|WRITE, and EXECUTE is never added to the alias. */
+
+    bringup_mark(&g_bringup.rw_alias, 1);
 
     *exec_out = rx;
     *write_out = (void *)rw;
+    if (usable_out != NULL) { *usable_out = (size_t)usable; }
     return DROIDVM_JIT_OK;
 }
 
@@ -531,6 +827,15 @@ droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
     /* THE ONE-SHOT CHECK COMES BEFORE THE TRAP, and so does the flag that consumes it. Anything
      * that ran the prepare already reported its evidence; asking again would claim another region
      * that is never released. */
+    /* A REGION THAT WAS RELEASED IS NOT STILL HELD. The one-shot replays its cached status on a
+     * repeat, and after a release that status is a stale OK whose out-parameter is never filled --
+     * so Swift would read two null pointers as a valid ready region. */
+    if (g_prepare_consumed && g_region_released) {
+        droidvm_jit_set_reason("the one-shot diagnostic ran and its region was then released; "
+                               "nothing is held. Relaunch to attempt once more.");
+        return DROIDVM_JIT_NOT_PERMITTED;
+    }
+
     if (g_prepare_consumed) {
         /* g_prepare_reason, NOT g_reason. The probe has almost certainly overwritten g_reason by
          * now, and reporting that as the first attempt's evidence would hide exactly what the
@@ -544,46 +849,72 @@ droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out)
 
     void *executable = NULL;
     void *writable = NULL;
-    droidvm_jit_status status = make_views(bytes, &executable, &writable);
+    size_t usable = 0;
+    droidvm_jit_status status = make_views(bytes, &executable, &writable, &usable);
     if (status != DROIDVM_JIT_OK) {
         g_prepare_status = status;
         snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
-        /* make_views runs the prepare trap BEFORE it can fail, so provider state may exist even
-         * though we obtained nothing usable -- and make_views detaches and deallocates on each of
-         * its own failure paths. Nothing is left for this branch to release. */
+        /* make_views detaches and releases its own alias on every failure path. */
+        return status;
+    }
+    g_usable = usable;
+
+    /* PHASE 4 -- read/write verification over the PROVEN range. */
+    status = verify_readback(executable, writable, usable);
+    bringup_mark(&g_bringup.readback, status == DROIDVM_JIT_OK);
+    if (status != DROIDVM_JIT_OK) {
+        g_prepare_status = status;
+        snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
+        vm_deallocate(mach_task_self(), (vm_address_t)writable, (vm_size_t)usable);
+        droidvm_jit_break_detach();
         return status;
     }
 
-    /* DIAGNOSTIC BUILD -- THIS PATH NEVER EXECUTES THE REGION, so it never reports one as ready.
-     *
-     * `g_held` is deliberately not set and the out-parameter is deliberately not written: nothing
-     * has been shown to be executable, and claiming otherwise is the failure this project exists
-     * not to make.
-     *
-     * The success path (set `g_held`, fill `*out`, return OK) returns when the alias contract is
-     * proven from the device evidence this function produces -- as a decision backed by data, not
-     * as a line left lying around. */
-    status = diagnose_views(executable, writable, bytes);
-    g_prepare_status = status;
-    snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
-
-    /* GET OUT CLEANLY, FREEING ONLY WHAT IS OURS.
-     *
-     * The writable alias was created here by vm_remap, so it is DroidVM's to release and it is
-     * released.
-     *
-     * The provider's region is NOT released. It was created by the external JIT provider and there
-     * is no proven ownership contract that says DroidVM may unmap it -- while `region_probe` reports
-     * the size of the whole VM region CONTAINING the address, so freeing that many bytes could unmap
-     * memory that is not part of the allocation at all. Its lifetime is therefore left to process
-     * termination in this diagnostic build, which is the safe choice while the contract is unproven.
-     *
-     * The detach is unconditional: the debugger's script must not be left waiting. */
-    vm_deallocate(mach_task_self(), (vm_address_t)writable, (vm_size_t)bytes);
+    /* DETACH BEFORE EXECUTING. The provider's work is done: the region is a task mapping that
+     * outlives the debugger, and leaving the script waiting while we execute would be both pointless
+     * and untidy. Detaching here also means a fault in the self-test cannot leave it half-serviced. */
     droidvm_jit_break_detach();
 
-    return status;
+    /* PHASE 5 -- the only execution. */
+    status = run_self_test(executable);
+    bringup_mark(&g_bringup.jit_selftest, status == DROIDVM_JIT_OK);
+    if (status != DROIDVM_JIT_OK) {
+        g_prepare_status = status;
+        snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
+        /* The alias is ours, so it goes back. The provider's region is NOT released: it was never
+         * ours to allocate, and no ownership contract for it is proven. */
+        vm_deallocate(mach_task_self(), (vm_address_t)writable, (vm_size_t)usable);
+        return status;
+    }
 
+    /* ---------------------------------------------------------------- ALL GREEN: jit = READY
+     *
+     * This is the only exit that reports a region as usable, and it is reached only after the range
+     * was MEASURED, the alias bounded by that measurement, the bytes verified in both directions, and
+     * a stub actually executed and returned the right value. */
+    g_region.executable = executable;
+    g_region.writable = writable;
+    g_region.size = usable;
+    g_held = 1;
+
+    g_prepare_status = DROIDVM_JIT_OK;
+    g_region_released = 0;
+    droidvm_jit_set_reason("jit=READY "
+                           "requested_bytes=%zu usable_bytes=%zu "
+                           "provider_rx=%p first_region_size=%llu regions_walked=%u "
+                           "range_complete=%d first_gap_offset=%d gap_reason=%d "
+                           "rx_cur_prot=%d rx_max_prot=%d rw_alias=%p "
+                           "readback_match=1 jit_selftest=42",
+                           bytes, usable,
+                           executable,
+                           g_range.first_region_size, g_range.regions_walked,
+                           g_range.range_complete, g_range.first_gap_offset, g_range.gap_reason,
+                           g_range.first_cur_prot, g_range.first_max_prot, writable);
+
+    snprintf(g_prepare_reason, sizeof(g_prepare_reason), "%s", g_reason);
+    if (out != NULL) { *out = g_region; }
+    return DROIDVM_JIT_OK;
+}
 #else
     /* The development host. There is no debugger to service the trap and no iOS to
      * restrict the mapping, so the honest answer is that the mechanism is unsupported --
@@ -617,6 +948,7 @@ droidvm_jit_status droidvm_jit_release(void)
     vm_deallocate(mach_task_self(), (vm_address_t)g_region.writable, (vm_size_t)g_region.size);
 #endif
 
+    g_region_released = 1;
     g_region.executable = NULL;
     g_region.writable = NULL;
     g_region.size = 0;

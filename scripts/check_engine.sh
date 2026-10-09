@@ -228,15 +228,84 @@ else
     #
     # Comment lines are stripped first, because prose about function pointers is not one.
     code_lines="$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C")"
-    indirect="$(printf '%s\n' "$code_lines" \
-                | grep -nE '\([[:space:]]*\*[[:space:]]*[A-Za-z_]|\([[:space:]]*void[[:space:]]*\([[:space:]]*\*' || true)"
-    if [ -z "$indirect" ]; then
-        echo "  ok:   no function-pointer cast or call exists in the diagnostic build"
+
+    # EXACTLY ONE INDIRECT EXECUTION, AND IT LIVES IN run_self_test.
+    #
+    # Asking whether the call appears after the function's DECLARATION proves nothing -- moving it into
+    # any later function passes. So this extracts the BODY, inspects it, and then removes it and
+    # requires the remainder of the file to contain no indirect execution at all.
+    selftest_body="$(awk '/^static droidvm_jit_status run_self_test\(/{f=1;next} f&&/^}/{exit} f{print}' "$JIT_C")"
+    file_without_body="$(awk '/^static droidvm_jit_status run_self_test\(/{f=1;next} f&&/^}/{f=0;next} !f{print}' "$JIT_C")"
+
+    body_calls=$(printf '%s\n' "$selftest_body" | grep -cE 'fn\(\)' || true)
+    body_casts=$(printf '%s\n' "$selftest_body" | grep -cE '\(droidvm_selftest_fn\)' || true)
+    rest_indirect=$(printf '%s\n' "$file_without_body" | grep -cE 'fn\(\)|\(droidvm_selftest_fn\)' || true)
+    body_lines=$(printf '%s\n' "$selftest_body" | grep -c . || true)
+
+    if [ "${body_lines:-0}" -gt 10 ] && [ "${body_calls:-0}" -eq 1 ] && [ "${body_casts:-0}" -eq 1 ] \
+       && [ "${rest_indirect:-1}" -eq 0 ]; then
+        echo "  ok:   exactly one indirect execution, inside run_self_test ($body_lines body lines); none elsewhere"
     else
-        echo "      FAIL: the diagnostic build can call through a function pointer:"
-        printf '%s\n' "$indirect" | sed 's/^/            /'
+        echo "      FAIL: indirect execution is not confined to run_self_test (body_lines=$body_lines calls_in_body=$body_calls casts_in_body=$body_casts elsewhere=$rest_indirect)"
         jit_failed=1
     fi
+
+    # The body must arm its fault guard BEFORE the call, and only for its own thread.
+    if printf '%s\n' "$selftest_body" | grep -q 'g_selftest_thread = (uintptr_t)pthread_self();' \
+       && printf '%s\n' "$selftest_body" | grep -q 'g_selftest_armed = 1;' \
+       && printf '%s\n' "$selftest_body" | grep -q 'sigsetjmp(g_selftest_jmp'; then
+        echo "  ok:   the self-test arms a thread-confined fault guard around its call"
+    else
+        echo "      FAIL: the self-test calls without arming its fault guard first"
+        jit_failed=1
+    fi
+
+    # AND THE REACHABILITY ORDER: in capture, readback must be verified, then detached, then the
+    # self-test run. Line order in the CALLER, which is where the sequence actually lives.
+    verify_at="$(grep -n 'status = verify_readback(executable, writable, usable);' "$JIT_C" | head -1 | cut -d: -f1)"
+    run_at="$(grep -n 'status = run_self_test(executable);' "$JIT_C" | head -1 | cut -d: -f1)"
+    # A PARTIAL RANGE MUST BE REFUSED. `acquire(bytes:)` promises at least `bytes`, so the measured
+    # range has to cover the request; a prefix that merely executes is not a smaller success.
+    if grep -q 'if (!range.range_complete) {' "$JIT_C" \
+       && grep -q 'a partial range cannot satisfy the request' "$JIT_C"; then
+        echo "  ok:   a range that does not cover requested_bytes is refused, not downgraded"
+    else
+        echo "      FAIL: a partial provider range could still reach READY"
+        jit_failed=1
+    fi
+
+    # THE ALIAS MUST BE CREATED AND VALIDATED BEFORE ANY READBACK. Readback writes through the alias
+    # and reads through the executable view, so a missing or failed alias would have it comparing
+    # against unmapped memory.
+    alias_remap="$(grep -n 'vm_remap(mach_task_self' "$JIT_C" | head -1 | cut -d: -f1)"
+    alias_mark="$(grep -n 'bringup_mark(&g_bringup.rw_alias, 1);' "$JIT_C" | head -1 | cut -d: -f1)"
+    verify_call="$(grep -n 'status = verify_readback(executable, writable, usable);' "$JIT_C" | head -1 | cut -d: -f1)"
+    if [ -n "$alias_remap" ] && [ -n "$alias_mark" ] && [ -n "$verify_call" ] \
+       && [ "$alias_remap" -lt "$alias_mark" ] && [ "$alias_mark" -lt "$verify_call" ] \
+       && grep -q 'vm_protect(mach_task_self(), rw, (vm_size_t)usable' "$JIT_C" \
+       && ! grep -q 'VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE' "$JIT_C"; then
+        echo "  ok:   the RW alias is remapped and protected READ|WRITE before any readback"
+    else
+        echo "      FAIL: readback could run without a validated READ|WRITE alias (remap=$alias_remap mark=$alias_mark verify=$verify_call)"
+        jit_failed=1
+    fi
+
+    if [ -n "$verify_at" ] && [ -n "$run_at" ] && [ "$verify_at" -lt "$run_at" ]; then
+        echo "  ok:   capture verifies the readback before it runs the self-test"
+    else
+        echo "      FAIL: the self-test can run without a verified readback (verify=$verify_at run=$run_at)"
+        jit_failed=1
+    fi
+
+    # The alias must exist before either: run_self_test takes only the executable address because the
+    # readback already proved the pair.
+    if grep -q 'static droidvm_jit_status run_self_test(void \*rx)$' "$JIT_C"; then
+        echo "  ok:   run_self_test cannot write: it receives only the verified executable view"
+    else
+        echo "      FAIL: run_self_test takes a writable view, so it could write unverified bytes"
+        jit_failed=1
+    fi
+
 
     # The self-test that executed must be gone, not merely unused.
     if grep -q 'static droidvm_jit_status self_test' "$JIT_C"; then
@@ -316,12 +385,16 @@ else
     if [ "$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'vm_protect.*VM_PROT_EXECUTE')" -gt 0 ]; then
         execute_granted=1
     fi
-    execute_lines=$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'VM_PROT_EXECUTE')
-    execute_validation=$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" | grep -c 'rx_prot & VM_PROT_EXECUTE')
-    if [ "$execute_granted" -eq 0 ] && [ "$execute_lines" -eq 1 ] && [ "$execute_validation" -eq 1 ]; then
-        echo "  ok:   EXECUTE is only ever validated, never granted by vm_protect"
+    # The COUNT is not the property. The bring-up path has two legitimate READERS of EXECUTE -- the
+    # prepare validation and the per-region check inside the walk -- and requiring exactly one would
+    # reject the second for no reason. What must hold is that every occurrence is a TEST and that none
+    # is ever OR-ed into a vm_protect argument.
+    execute_not_a_test=$(grep -vE '^[[:space:]]*(/\*|\*|//)' "$JIT_C" \
+                         | grep 'VM_PROT_EXECUTE' | grep -vc '& VM_PROT_EXECUTE' || true)
+    if [ "$execute_granted" -eq 0 ] && [ "${execute_not_a_test:-1}" -eq 0 ]; then
+        echo "  ok:   EXECUTE is only ever tested, never granted by vm_protect"
     else
-        echo "      FAIL: EXECUTE is granted or appears outside the single validation (granted=$execute_granted uses=$execute_lines validation=$execute_validation)"
+        echo "      FAIL: EXECUTE is granted, or used other than as a test (granted=$execute_granted non_test=$execute_not_a_test)"
         jit_failed=1
     fi
 

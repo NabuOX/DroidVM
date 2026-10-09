@@ -114,6 +114,38 @@ droidvm_jit_status droidvm_jit_probe(void);
  * returns once the provider's alias contract is proven from that evidence. */
 droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out);
 
+/* Where the bring-up pipeline got to, stage by stage.
+ *
+ * A single status cannot say which stage passed and which stopped: `FAILED` after a rejected range
+ * and `FAILED` after a stub that faulted are different problems, and the whole point of one
+ * consolidated device test is to tell them apart from one report. */
+typedef struct droidvm_bringup_stage {
+    int not_run;        /* 0 = the stage ran, 1 = it was never reached */
+    int passed;         /* meaningful only when not_run is 0 */
+} droidvm_bringup_stage;
+
+typedef struct droidvm_bringup_report {
+    droidvm_bringup_stage provider_prepare;
+    droidvm_bringup_stage provider_range;
+    droidvm_bringup_stage rw_alias;
+    droidvm_bringup_stage readback;
+    droidvm_bringup_stage jit_selftest;
+
+    unsigned long long requested_bytes;
+    unsigned long long contiguous_rx_bytes;   /* proven by the walk, before the request is judged */
+    unsigned long long usable_bytes;
+    unsigned long long first_region_size;
+    unsigned int regions_walked;
+    int range_complete;
+    int first_gap_offset;
+    int gap_reason;
+    int rx_cur_prot;
+    int rx_max_prot;
+} droidvm_bringup_report;
+
+/* The stages recorded so far. Safe to call at any time; untouched stages read as not_run. */
+void droidvm_jit_bringup_report_get(droidvm_bringup_report *out);
+
 /* Release the region, if the platform permits it. */
 droidvm_jit_status droidvm_jit_release(void);
 

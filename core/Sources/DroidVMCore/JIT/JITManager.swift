@@ -94,6 +94,14 @@ public protocol ExecutableMemoryBackend: AnyObject {
 
     /// Give the region back, if the platform allows it.
     func release()
+
+    /// The staged bring-up outcome, or nil when this backend does not implement the pipeline.
+    ///
+    /// DECLARED IN THE PROTOCOL, not only in an extension. `JITManager` holds the backend as an
+    /// existential, and an extension-only member is statically dispatched -- so the call resolved to
+    /// the extension's `nil` and a real implementation was never reached. A default in the extension
+    /// below keeps backends that have nothing to report from needing to change.
+    var bringUp: BringUpStages? { get }
 }
 
 /// A region of executable memory and its writable alias.
@@ -283,6 +291,9 @@ public final class JITManager: JITProvider, @unchecked Sendable {
     }
 
     // MARK: teardown
+
+    /// The staged bring-up outcome, forwarded from the backend. See `JITProvider.bringUp`.
+    public var bringUp: BringUpStages? { backend.bringUp }
 
     public func release() async {
         backend.release()

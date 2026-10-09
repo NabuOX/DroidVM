@@ -31,6 +31,9 @@ droidvm_jit_probe
 droidvm_jit_capture
 droidvm_jit_release
 droidvm_jit_last_reason
+# The staged bring-up outcome: which stage passed and which stopped. Read by the report, so a
+# single device test can name the stage instead of only reporting that JIT failed.
+droidvm_jit_bringup_report_get
 
 # --- DroidVM's display bridge ------------------------------------------------
 droidvm_display_register

@@ -88,23 +88,58 @@ mean "the engine started and something else was broken".
 `jit: UNAVAILABLE` remains a valid diagnostic outcome, and cannot produce a pass: without
 executable memory the engine's execution path never ran, so there is nothing to confirm.
 
-## Reading a JIT result
+## The bring-up flow
 
-| `jit:` | Meaning | Level D verdict |
-|---|---|---|
-| `READY` | Executable memory obtained and an execute self-test passed | continue |
-| `UNAVAILABLE` | The environment declined. Typically nothing is attached to enable it. **Not a fault and not an engine failure.** | run stops at `checkingJIT`; report `fail`, and say so rather than inventing a pass |
-| `FAILED` | An attempt was made and did not work | run stops; report `fail` with the reason |
-| `NOT RUN` | The provider returned no answer | reported as "did not get that far", never as a refusal |
-| `FAILED` — reason `diagnostic stop: …` | **The diagnostic build working as designed.** It asked the provider for the region, inspected it, and stopped before executing anything. The reason carries the evidence: `requested_bytes`, `provider_rx`, `provider_rx_region_base`, `provider_rx_region_size`, `provider_rx_cur_prot`, `provider_rx_max_prot`, `rw_alias`, `rw_region_size`, `alias_delta`, `readback_attempted`, `readback_match`, `wrote`, `read`, and a `vm_region_64` description of each address. **The prepare runs at most once per process**: a second Start reports the same evidence rather than asking again, and relaunching the app allows one fresh attempt | run stops; this is NOT an engine or runtime failure, and the reason must be read before concluding anything |
+One press of **Start Android**, one report:
 
-> **The diagnostic build cannot reach `READY`.** It never executes the region, so no self-test can
-> pass and no mapping can be called ready. A `diagnostic stop` in the report is expected on every
-> device run until the alias contract is proven and execution is deliberately restored. Reading it
-> as a failure would be reading a designed stop as a fault.
+1. install the IPA
+2. prepare JIT with StikDebug
+3. return to DroidVM
+4. press **Start Android** once
+5. send the single consolidated report
 
-`UNAVAILABLE` is **not** the same as `FAILED`, and the two are never collapsed: one is an
-environment that will not permit it, the other is something that broke.
+The pipeline is health-gated: each stage runs only if the one before it passed, and a failure names
+the stage that stopped it. The stages are reported as their own fields:
+
+| field | what it means |
+|---|---|
+| `provider_prepare` | the provider answered the fresh-region request (`x0 = NULL`, `x1 = requested_bytes`) with a `READ\|EXECUTE` mapping at its own base |
+| `provider_range` | the range was **walked** and covers all `requested_bytes`. One `vm_region_64` answer describes one region, so a first region of 16 KiB is not a 16 KiB allocation |
+| `rw_alias` | a writable alias of the proven range exists, `READ\|WRITE`, with `EXECUTE` never added |
+| `readback` | a known instruction sequence written through the alias read back byte-for-byte through the executable view, after `sys_icache_invalidate` |
+| `jit_selftest` | one stub executed from the region and returned the expected constant |
+| `jit` | `READY` only when every stage above passed, and only then do the later stages run |
+| `native_bridge`, `qemu_init`, `qemu_started`, `display_init` | as before, each gated on the previous |
+| `android_guest` | **`NOT RUN`** unless a guest monitor actually observed readiness. It is never inferred, and `boot_completed` alone is not readiness |
+
+A stage that was never reached reads **`NOT RUN`**, which is different from **`FAIL`**. `FAIL` means
+the stage ran and did not pass; `NOT RUN` means the pipeline stopped before it.
+
+### Reading the failure detail
+
+`detail:` carries the numbers behind the verdict, including `requested_bytes`,
+`contiguous_rx_bytes` (what the walk proved), `provider_rx`, `first_region_size`, `regions_walked`,
+`range_complete`, `gap_reason`, and the protections observed. A partial range is a **failure**, not a
+smaller success: `acquire(bytes:)` promises at least `bytes`, so a range that covers less than the
+request is refused and reported with both numbers.
+
+### Execution, and its confinement
+
+This build executes JIT memory in exactly one place: a four-instruction stub (`mov w0, #42 ; ret`)
+that returns the constant 42, written through the alias and verified through the executable view
+first. The engine gate proves that confinement structurally -- it extracts the `run_self_test` body
+and requires that no indirect execution exists anywhere else in the file. Nothing else in the build
+executes provider memory.
+
+The self-test arms a fault guard for its own thread only; a fault on any other thread keeps its
+default disposition and is re-raised, so an unrelated crash is still a crash.
+
+### What is still not proven
+
+`READY` means the region was measured, aliased, verified and executed. It does **not** mean Android
+starts. Level D passes only when the engine is confirmed running, and Level E only when the guest is
+usable. Android guest readiness is reported as `NOT RUN` until a guest monitor exists to answer for
+it.
 
 ## LEVEL D IS CURRENTLY BLOCKED ON TWO ENGINE INTEGRATIONS
 

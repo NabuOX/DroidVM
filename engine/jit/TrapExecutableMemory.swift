@@ -83,6 +83,22 @@ public final class TrapExecutableMemory: ExecutableMemoryBackend {
         return region
     }
 
+    /// Reads the bring-up stages the C layer recorded, so the report can name each one.
+    public var bringUp: BringUpStages? {
+        var raw = droidvm_bringup_report()
+        droidvm_jit_bringup_report_get(&raw)
+
+        func stage(_ s: droidvm_bringup_stage) -> BringUpStages.Stage {
+            if s.not_run != 0 { return .notRun }
+            return s.passed != 0 ? .passed : .failed
+        }
+        return BringUpStages(providerPrepare: stage(raw.provider_prepare),
+                             providerRange: stage(raw.provider_range),
+                             rwAlias: stage(raw.rw_alias),
+                             readback: stage(raw.readback),
+                             jitSelfTest: stage(raw.jit_selftest))
+    }
+
     public func release() {
         guard held != nil else { return }
         _ = droidvm_jit_release()

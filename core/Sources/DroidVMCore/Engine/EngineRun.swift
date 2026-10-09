@@ -209,6 +209,22 @@ public struct EngineRunReport: Equatable, Sendable {
 
     public var appLaunch: Verdict = .notRun
     public var runtimeController: Verdict = .notRun
+    /// The bring-up stages, in the order they run.
+    ///
+    /// One `jit:` verdict could not distinguish a rejected range from a failed readback from a stub
+    /// that faulted, and telling those apart is the entire point of a single consolidated device
+    /// test. `notRun` means the pipeline never reached the stage, which is different from reaching it
+    /// and failing.
+    public var providerPrepare: Verdict = .notRun
+    public var providerRange: Verdict = .notRun
+    public var rwAlias: Verdict = .notRun
+    public var readback: Verdict = .notRun
+    public var jitSelfTest: Verdict = .notRun
+
+    /// Android guest readiness. `notRun` until the engine and display are alive AND the guest
+    /// monitor has been asked -- a guest that was never observed is not an unready guest.
+    public var androidGuest: Verdict = .notRun
+
     public var jit: JITState = .notProbed
     public var jitReason: String?
     public var nativeBridge: Verdict = .notRun
@@ -224,6 +240,9 @@ public struct EngineRunReport: Equatable, Sendable {
 
     /// The user-safe reason, when there is one.
     public var failureReason: String?
+
+    /// Which stage stopped the run, in the report's own vocabulary.
+    public var failureStage: String?
 
     /// Where the stop happened, and any detail worth keeping. Not shown to a user.
     public var technicalDetail: String?
@@ -299,6 +318,11 @@ public struct EngineRunReport: Equatable, Sendable {
         lines.append("LEVEL D DEVICE REPORT")
         lines.append("app_launch: \(appLaunch.rawValue)")
         lines.append("runtime_controller: \(runtimeController.rawValue)")
+        lines.append("provider_prepare: \(providerPrepare.rawValue)")
+        lines.append("provider_range: \(providerRange.rawValue)")
+        lines.append("rw_alias: \(rwAlias.rawValue)")
+        lines.append("readback: \(readback.rawValue)")
+        lines.append("jit_selftest: \(jitSelfTest.rawValue)")
         lines.append("jit: \(jit.rawValue)")
         lines.append("jit_reason: \(jitReason ?? "-")")
         lines.append("native_bridge: \(nativeBridge.rawValue)")
@@ -306,7 +330,9 @@ public struct EngineRunReport: Equatable, Sendable {
         lines.append("qemu_started: \(qemuStarted.rawValue)")
         lines.append("display_init: \(displayInit.rawValue)")
         lines.append(contentsOf: display.renderedLines)
+        lines.append("android_guest: \(androidGuest.rawValue)")
         lines.append("crash: \(crashed ? "YES" : "NO")")
+        lines.append("failure_stage: \(failureStage ?? "-")")
         lines.append("failure_reason: \(failureReason ?? "-")")
         lines.append("result: \(result.rawValue)")
         if let technicalDetail, !technicalDetail.isEmpty {

@@ -204,6 +204,18 @@ public final class EngineRunCoordinator {
         let readiness = await jit.prepareRuntime()
         breadcrumbs?.record(.jitProbeReturned)
 
+        // RECORD THE BRING-UP STAGES ON EVERY OUTCOME, not only on success. A report that says
+        // `jit: FAILED` and nothing else cannot say WHICH stage failed, and telling a rejected range
+        // from a failed readback from a stub that faulted is the entire purpose of running the whole
+        // pipeline in one device session.
+        if let stages = jit.bringUp {
+            report.providerPrepare = Self.verdict(stages.providerPrepare)
+            report.providerRange = Self.verdict(stages.providerRange)
+            report.rwAlias = Self.verdict(stages.rwAlias)
+            report.readback = Self.verdict(stages.readback)
+            report.jitSelfTest = Self.verdict(stages.jitSelfTest)
+        }
+
         switch readiness {
         case .ready:
             report.jit = .ready
@@ -399,9 +411,19 @@ public final class EngineRunCoordinator {
     ///
     /// Every failure path in `run()` comes through here, so there is exactly one place a
     /// failure state is produced and no path that can leave the UI on a spinner.
+    /// The one place a bring-up stage becomes a report verdict.
+    private static func verdict(_ stage: BringUpStages.Stage) -> EngineRunReport.Verdict {
+        switch stage {
+        case .notRun: return .notRun
+        case .passed: return .pass
+        case .failed: return .fail
+        }
+    }
+
     private func fail(stage: EngineRunFailure.Stage,
                       reason: String,
                       technical: String) -> EngineRunReport {
+        report.failureStage = stage.rawValue
         let failure = EngineRunFailure(stage: stage, reason: reason, technical: technical)
         report.failureReason = reason
         report.technicalDetail = "\(stage.rawValue): \(technical)"

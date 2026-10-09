@@ -126,12 +126,47 @@ public protocol JITProvider: AnyObject, Sendable {
     /// or it is lost, and a device diagnostic whose evidence never reaches the report has collected
     /// nothing.
     var technicalDetail: String { get }
+
+    /// Where the bring-up pipeline got to, stage by stage. `nil` when the provider has nothing to
+    /// report -- the report then shows `NOT RUN`, which is the honest value.
+    var bringUp: BringUpStages? { get }
+}
+
+/// The per-stage outcome of the bring-up pipeline, as the JIT layer recorded it.
+public struct BringUpStages: Equatable, Sendable {
+    public enum Stage: Equatable, Sendable { case notRun, passed, failed }
+    public var providerPrepare: Stage
+    public var providerRange: Stage
+    public var rwAlias: Stage
+    public var readback: Stage
+    public var jitSelfTest: Stage
+
+    public init(providerPrepare: Stage, providerRange: Stage, rwAlias: Stage,
+                readback: Stage, jitSelfTest: Stage) {
+        self.providerPrepare = providerPrepare
+        self.providerRange = providerRange
+        self.rwAlias = rwAlias
+        self.readback = readback
+        self.jitSelfTest = jitSelfTest
+    }
 }
 
 public extension JITProvider {
     /// Empty unless a provider has something detailed to say. A default so conformers that only
     /// implement the product-facing surface stay valid.
     var technicalDetail: String { "" }
+
+    /// A provider that does not implement the bring-up pipeline reports nothing rather than
+    /// pretending every stage was reached.
+    var bringUp: BringUpStages? { nil }
+}
+
+/// The bring-up stages, carried from the layer that decides them.
+public extension ExecutableMemoryBackend {
+    /// nil when the backend does not implement the staged bring-up pipeline. This default is why
+    /// `bringUp` is also declared in the protocol: the declaration is what makes a real implementation
+    /// reachable through an existential.
+    var bringUp: BringUpStages? { nil }
 }
 
 /// The display path: how guest pixels reach the screen, and what happened on the way.

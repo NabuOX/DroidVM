@@ -49,6 +49,11 @@ private final class StubJIT: JITProvider, @unchecked Sendable {
     /// What the provider would put in the report's technical field.
     var technicalDetailValue = ""
     var technicalDetail: String { technicalDetailValue }
+
+    /// Supplied explicitly. nil means this provider has no staged pipeline to report, which
+    /// the report must show as NOT RUN.
+    var bringUpValue: BringUpStages?
+    var bringUp: BringUpStages? { bringUpValue }
     private(set) var prepareCalls = 0
     private(set) var readiness: RuntimeReadiness = .unknown
 
@@ -535,8 +540,18 @@ final class EngineRunTests: XCTestCase {
     func testNoAndroidClaimIsMade() async {
         let report = await makeCoordinator().run()
 
+        // THE REPORT NOW CARRIES AN `android_guest` FIELD, and it has to: one consolidated device
+        // test must be able to say whether the guest was ever observed. What it must not do is claim
+        // readiness. The field is a verdict, and the only verdict this coordinator can produce
+        // without a guest monitor is NOT RUN.
+        XCTAssertEqual(report.androidGuest, .notRun,
+                       "no guest monitor ran here, so the report must say NOT RUN, not a claim")
+        XCTAssertNotEqual(report.androidGuest.rawValue, "READY",
+                          "readiness may only come from the guest monitor")
+
+        // The phrases that would over-claim stay forbidden, so this test keeps its teeth.
         let text = report.rendered.lowercased()
-        for forbidden in ["android", "boot", "launcher", "systemui", "system_ui",
+        for forbidden in ["boot_completed", "launcher", "systemui", "system_ui",
                           "frame", "ready_to_use"] {
             XCTAssertFalse(text.contains(forbidden),
                            "the Level D report must not mention '\(forbidden)'")
@@ -564,11 +579,15 @@ final class EngineRunTests: XCTestCase {
         XCTAssertEqual(Array(lines.dropFirst().map { String($0.split(separator: ":")[0]) }),
                        // The display observation sits with the verdict it qualifies. These
                        // keys are part of the report format, so adding one is deliberate.
-                       ["app_launch", "runtime_controller", "jit", "jit_reason",
+                       ["app_launch", "runtime_controller",
+                        "provider_prepare", "provider_range", "rw_alias", "readback",
+                        "jit_selftest",
+                        "jit", "jit_reason",
                         "native_bridge", "qemu_init", "qemu_started", "display_init",
                         "display_state", "display_width", "display_height", "display_stride",
                         "display_updates", "display_surface_replacements", "display_last_reason",
-                        "crash", "failure_reason", "result"])
+                        "android_guest",
+                        "crash", "failure_stage", "failure_reason", "result"])
         XCTAssertTrue(report.rendered.hasSuffix("result: PASS"))
     }
 
@@ -786,5 +805,74 @@ final class EngineRunTests: XCTestCase {
         let report = await makeCoordinator(jit: jit).run()
 
         XCTAssertEqual(report.jitReason, "Android's runtime check stopped before running any code.")
+    }
+
+    // MARK: bring-up stage plumbing
+
+    /// THE TEST THAT CATCHES FINDING 2. `bringUp` was an extension-only member, so the existential
+    /// call was statically dispatched and always returned nil -- every stage printed NOT RUN however
+    /// well the pipeline ran. A test that supplies explicit verdicts and demands them back fails if
+    /// that ever happens again.
+    func testBringUpStagesReachTheRenderedReport() async {
+        let jit = StubJIT()
+        jit.bringUpValue = BringUpStages(providerPrepare: .passed,
+                                         providerRange: .passed,
+                                         rwAlias: .failed,
+                                         readback: .notRun,
+                                         jitSelfTest: .notRun)
+
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertEqual(report.providerPrepare, .pass)
+        XCTAssertEqual(report.providerRange, .pass)
+        XCTAssertEqual(report.rwAlias, .fail)
+        XCTAssertEqual(report.readback, .notRun)
+        XCTAssertEqual(report.jitSelfTest, .notRun)
+
+        XCTAssertTrue(report.rendered.contains("provider_prepare: PASS"), report.rendered)
+        XCTAssertTrue(report.rendered.contains("provider_range: PASS"), report.rendered)
+        XCTAssertTrue(report.rendered.contains("rw_alias: FAIL"), report.rendered)
+        XCTAssertTrue(report.rendered.contains("readback: NOT RUN"), report.rendered)
+        XCTAssertTrue(report.rendered.contains("jit_selftest: NOT RUN"), report.rendered)
+    }
+
+    /// Each state means one thing: untouched is NOT RUN, and only an attempted stage may be FAIL.
+    func testEachStageStateRendersItsOwnVerdict() async {
+        let jit = StubJIT()
+        jit.bringUpValue = BringUpStages(providerPrepare: .notRun,
+                                         providerRange: .passed,
+                                         rwAlias: .passed,
+                                         readback: .passed,
+                                         jitSelfTest: .failed)
+
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertEqual(report.providerPrepare, .notRun, "untouched must be NOT RUN, never FAIL")
+        XCTAssertEqual(report.jitSelfTest, .fail, "an attempted stage that failed is FAIL")
+        XCTAssertTrue(report.rendered.contains("provider_prepare: NOT RUN"), report.rendered)
+        XCTAssertTrue(report.rendered.contains("jit_selftest: FAIL"), report.rendered)
+    }
+
+    /// NO SILENT SUBSTITUTION. A provider with nothing to report must be distinguishable from one
+    /// whose report was dropped in transit -- so the nil case is asserted explicitly.
+    func testAProviderWithoutStagesReportsAllNotRun() async {
+        let jit = StubJIT()
+        jit.bringUpValue = nil
+
+        let report = await makeCoordinator(jit: jit).run()
+
+        XCTAssertEqual(report.providerPrepare, .notRun)
+        XCTAssertEqual(report.providerRange, .notRun)
+        XCTAssertEqual(report.rwAlias, .notRun)
+        XCTAssertEqual(report.readback, .notRun)
+        XCTAssertEqual(report.jitSelfTest, .notRun)
+    }
+
+    /// Android readiness is never inferred. Without a guest monitor it stays NOT RUN, and the report
+    /// must not contain a readiness claim.
+    func testAndroidGuestIsNotReadyWithoutAMonitor() async {
+        let report = await makeCoordinator().run()
+        XCTAssertEqual(report.androidGuest, .notRun)
+        XCTAssertTrue(report.rendered.contains("android_guest: NOT RUN"), report.rendered)
     }
 }
