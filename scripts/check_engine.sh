@@ -321,14 +321,28 @@ else
     # earlier version stayed green with the guard deleted, which is a check that cannot fail.
     # The bits are not enough: `DROIDVM_REGION_UNMAPPED` is -1, so every bit test passes for an
     # unmapped address. The sentinel must be excluded first, and this requires it.
-    if grep -q 'rx_prot & VM_PROT_READ' "$JIT_C" \
-       && grep -q 'rw_prot & VM_PROT_WRITE' "$JIT_C" \
-       && grep -q 'rx_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
-       && grep -q 'rw_prot != DROIDVM_REGION_UNMAPPED' "$JIT_C" \
-       && grep -q 'vm_region_64' "$JIT_C"; then
-        echo "  ok:   the readback needs SUCCESSFUL lookups and the right protection bits"
+    # The readback is `verify_readback` now: it writes the stub through the ALIAS, invalidates the
+    # instruction cache, reads back through the EXECUTABLE view, and fails on any mismatch. The old
+    # patterns described the inspect-only diagnostic, which no longer exists -- so this checks the
+    # property as it is actually implemented.
+    if grep -q 'static droidvm_jit_status verify_readback(void \*rx, void \*rw, size_t usable)' "$JIT_C" \
+       && grep -q 'memcpy(rw, kStub, stub_bytes);' "$JIT_C" \
+       && grep -q 'sys_icache_invalidate(rx, stub_bytes);' "$JIT_C" \
+       && grep -q 'memcmp(rx, kStub, stub_bytes) != 0' "$JIT_C" \
+       && grep -q 'if (usable < stub_bytes) {' "$JIT_C"; then
+        echo "  ok:   the readback writes through the alias, invalidates, reads through RX, requires a match"
     else
-        echo "      FAIL: an unmapped address could pass the readback guard (-1 has every bit set)"
+        echo "      FAIL: the readback does not verify both views and require an exact match"
+        jit_failed=1
+    fi
+
+    # AND THE WALK MUST REQUIRE READ, so the readback cannot be handed an execute-only mapping it
+    # would read before any fault guard exists.
+    if grep -q '(ri.cur_prot & VM_PROT_EXECUTE) == 0 || (ri.cur_prot & VM_PROT_READ) == 0' "$JIT_C" \
+       && grep -q 'vm_region_64' "$JIT_C"; then
+        echo "  ok:   the range walk requires READ|EXECUTE, so the readback reads only mapped pages"
+    else
+        echo "      FAIL: an execute-only mapping could reach the readback (which has no guard yet)"
         jit_failed=1
     fi
 

@@ -183,9 +183,11 @@ public enum EngineRunState: Equatable, Sendable {
 /// mean either overclaiming the display or refusing to report an engine that genuinely
 /// started.
 ///
-/// There is no field here for Android, and a test asserts that. `result: PASS` says the engine
-/// started on a real device. It does not say a guest booted, that anything was drawn, or that
-/// a single instruction of Android ran.
+/// The report CARRIES an `android_guest` field, because one consolidated device test has to be able
+/// to say whether the guest was ever observed at all. It reads `NOT RUN` unless a guest monitor
+/// actually reported readiness, and readiness is never inferred: `boot_completed` alone is not
+/// readiness. `result: PASS` says the engine started on a real device. It does not say a guest booted,
+/// that anything was drawn, or that a single instruction of Android ran.
 public struct EngineRunReport: Equatable, Sendable {
 
     public enum Verdict: String, Equatable, Sendable {

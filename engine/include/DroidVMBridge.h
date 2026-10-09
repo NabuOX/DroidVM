@@ -99,19 +99,23 @@ typedef enum droidvm_jit_status {
 /* Non-destructive availability check. Never traps, never allocates. */
 droidvm_jit_status droidvm_jit_probe(void);
 
-/* DIAGNOSTIC BUILD: this cannot currently reach DROIDVM_JIT_OK.
+/* The bring-up pipeline, in one call.
  *
- * It asks the provider for the executable region, INSPECTS it -- reporting the provider-returned
- * RX address and the kernel's description of every address involved -- and returns
- * DROIDVM_JIT_DIAGNOSTIC_STOP. It executes nothing, so it does not self-test, does not fill `out`,
- * and never reports a region as ready.
+ * It asks the provider for the executable region (x0 = NULL, x1 = `bytes`), MEASURES the returned
+ * range rather than presuming it from one vm_region_64 answer, aliases the proven range READ|WRITE,
+ * writes a known instruction sequence through the alias and verifies it back through the executable
+ * view, and -- only if all of that passed -- executes one stub from the region and requires the
+ * expected constant back.
  *
- * The provider's region is deliberately NOT released: no ownership contract for it is proven yet,
- * so its lifetime is left to process termination rather than risk unmapping memory DroidVM does not
- * own. The local writable alias, which DroidVM does create, is released on every path.
+ * Returns DROIDVM_JIT_OK and fills `out` only when every stage passed, which is what `jit: READY`
+ * means. Any earlier failure returns that stage's status with the stage named in the reason.
  *
- * A stop here is the build WORKING AS DESIGNED, not a runtime failure. The executing self-test
- * returns once the provider's alias contract is proven from that evidence. */
+ * The provider's region is deliberately NOT released: no ownership contract for it is proven, so its
+ * lifetime is left to process termination rather than risk unmapping memory DroidVM does not own. The
+ * local writable alias, which DroidVM does create, is released on every failure path and held on
+ * success.
+ *
+ * The prepare runs at most once per process. */
 droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out);
 
 /* Where the bring-up pipeline got to, stage by stage.

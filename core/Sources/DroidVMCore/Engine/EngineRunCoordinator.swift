@@ -330,7 +330,15 @@ public final class EngineRunCoordinator {
         // rather than one being hidden behind the other.
         await attemptDisplay()
 
-        finish()
+        // EXACTLY ONE FINAL REPORT PER RUN.
+        //
+        // `fail(...)` already calls `finish()`, and since the display failure paths were routed
+        // through it, an unconditional `finish()` here emitted a SECOND `level_d_report` for the same
+        // press -- two acceptance records, and possibly two different telemetry snapshots. A run that
+        // has already failed is already finished.
+        if !state.isFailure {
+            finish()
+        }
         return report
     }
 
@@ -372,10 +380,9 @@ public final class EngineRunCoordinator {
             // No answer inside the deadline. The engine may well be running; the surface is not,
             // and Level D requires it, so this fails rather than being recorded and forgotten.
             report.displayInit = .fail
-            transition(to: .failed(EngineRunFailure(
-                stage: .displayAttachTimeout,
-                reason: "The display did not finish starting.",
-                technical: "no attachment within \(Int(deadline))s")))
+            fail(stage: .displayAttachTimeout,
+                 reason: "The display did not finish starting.",
+                 technical: "no attachment within \(Int(deadline))s")
             return
         }
 
@@ -388,20 +395,18 @@ public final class EngineRunCoordinator {
         case .attached(false):
             report.displayInit = .fail
             noteHostAttachment?(false)
-            transition(to: .failed(EngineRunFailure(
-                stage: .display,
-                reason: "The display could not be started.",
-                technical: "the display backend reported that it is not attached")))
+            fail(stage: .display,
+                 reason: "The display could not be started.",
+                 technical: "the display backend reported that it is not attached")
 
         case .failed(let detail):
             report.displayInit = .fail
             recorder.emit(DiagnosticEventName.displayAttached, [
                 DiagnosticField.reason: .string(detail),
             ])
-            transition(to: .failed(EngineRunFailure(
-                stage: .display,
-                reason: "The display could not be started.",
-                technical: detail)))
+            fail(stage: .display,
+                 reason: "The display could not be started.",
+                 technical: detail)
         }
     }
 

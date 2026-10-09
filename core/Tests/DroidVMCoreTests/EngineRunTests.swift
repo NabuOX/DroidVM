@@ -239,6 +239,14 @@ final class EngineRunTests: XCTestCase {
             return XCTFail("expected failed, got \(coordinator.state)")
         }
         XCTAssertEqual(failure.stage, .display)
+        // The REPORT fields, not just the state. These three display paths used to transition
+        // straight to `.failed` and bypass `fail(...)`, so a device report rendered
+        // `failure_stage: -` and `failure_reason: -` for a display failure.
+        XCTAssertEqual(report.failureStage, EngineRunFailure.Stage.display.rawValue)
+        XCTAssertFalse((report.failureReason ?? "").isEmpty,
+                       "a display failure must carry a reason into the report")
+        XCTAssertTrue(report.rendered.contains("failure_stage: display"), report.rendered)
+        XCTAssertFalse(report.rendered.contains("failure_reason: -"), report.rendered)
         // The engine itself did start, and that is still recorded honestly.
         XCTAssertEqual(report.qemuStarted, .pass)
     }
@@ -271,6 +279,10 @@ final class EngineRunTests: XCTestCase {
             return XCTFail("expected failed, got \(coordinator.state)")
         }
         XCTAssertEqual(failure.stage, .displayAttachTimeout)
+        // The timeout path bypassed `fail(...)` too, so it is asserted here as well.
+        XCTAssertEqual(report.failureStage, EngineRunFailure.Stage.displayAttachTimeout.rawValue)
+        XCTAssertFalse((report.failureReason ?? "").isEmpty)
+        XCTAssertTrue(report.rendered.contains("failure_stage: display_attach_timeout"), report.rendered)
     }
 
     func testNoDisplayConfiguredCannotPass() async {
@@ -874,5 +886,30 @@ final class EngineRunTests: XCTestCase {
         let report = await makeCoordinator().run()
         XCTAssertEqual(report.androidGuest, .notRun)
         XCTAssertTrue(report.rendered.contains("android_guest: NOT RUN"), report.rendered)
+    }
+
+    /// A DISPLAY FAILURE MUST PRODUCE EXACTLY ONE FINAL REPORT.
+    ///
+    /// `fail(...)` calls `finish()`, and every display failure path goes through it -- so `run()`'s
+    /// own trailing `finish()` emitted a SECOND `level_d_report` for the same press. Two acceptance
+    /// records from one run, and possibly two different telemetry snapshots.
+    func testDisplayFailureEmitsExactlyOneFinalReport() async {
+        let ring = RingBufferSink(capacity: 50)
+        let recorder = DiagnosticsRecorder()
+        recorder.add(ring)
+
+        let display = StubDisplay()
+        display.attachSucceeds = false
+
+        let report = await makeCoordinator(display: display, recorder: recorder).run()
+
+        let finals = ring.contents.filter { $0.contains("level_d_report") }
+        XCTAssertEqual(finals.count, 1,
+                       "one run must emit exactly one final report; got \(finals.count)")
+
+        // The failure is still reported in full, which is the thing the single report must carry.
+        XCTAssertEqual(report.failureStage, EngineRunFailure.Stage.display.rawValue)
+        XCTAssertFalse((report.failureReason ?? "").isEmpty)
+        XCTAssertTrue(report.rendered.contains("failure_stage: display"), report.rendered)
     }
 }

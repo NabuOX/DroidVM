@@ -11,8 +11,13 @@ Level D PASS means: **the DroidVM engine starts on a real iPhone.**
 
 It does **not** mean Android booted, that the Android UI appeared, that the launcher or any
 system service is ready, that an APK runs, or that graphics perform acceptably. Those belong to
-Level E and later. The device report has no field for them, and a host test asserts that its
-key set is closed, so a future change cannot quietly add one.
+Level E and later.
+
+The report does carry an `android_guest` field, and it says exactly that much: `NOT RUN` unless a
+guest monitor actually observed readiness, never inferred. **Its existence does not make Android
+readiness part of Level D** — `result: PASS` still claims only that the engine started. A host test
+asserts the field cannot read `READY` without a monitor behind it, and that the report's key set is
+closed, so a future change cannot quietly widen the claim.
 
 ## Why the host tests cannot do this
 
