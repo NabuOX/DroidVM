@@ -34,6 +34,10 @@ droidvm_jit_last_reason
 # The staged bring-up outcome: which stage passed and which stopped. Read by the report, so a
 # single device test can name the stage instead of only reporting that JIT failed.
 droidvm_jit_bringup_report_get
+# The walk's region cap, derived from the request. Exported because it is PORTABLE and the host
+# regression test calls it: a fixed cap of 4096 is smaller than a 1 GiB request needs at 16 KiB
+# granularity, which is how a self-imposed limit came to be reported as a 64 MiB provider range.
+droidvm_walk_region_bound
 
 # --- DroidVM's display bridge ------------------------------------------------
 droidvm_display_register

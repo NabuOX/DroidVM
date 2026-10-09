@@ -110,6 +110,21 @@ void droidvm_jit_bringup_report_get(droidvm_bringup_report *out)
     *out = g_bringup;
 }
 
+/* The walk's region cap for a request of `requested` bytes.
+ *
+ * PORTABLE, and deliberately so: this arithmetic IS the bug. A fixed cap of 4096 is smaller than a
+ * 1 GiB request needs at arm64's 16 KiB granularity -- a gigabyte is 65536 regions -- so the walk
+ * stopped at its own ceiling and the range was reported as a 64 MiB provider allocation. Deriving the
+ * bound from the request is what makes that impossible, and being portable is what lets the host
+ * regression test check the number rather than trust it. */
+#define DROIDVM_MIN_PAGE_SIZE  16384ull
+#define DROIDVM_WALK_MARGIN    1024ull
+
+unsigned long long droidvm_walk_region_bound(unsigned long long requested)
+{
+    return requested / DROIDVM_MIN_PAGE_SIZE + DROIDVM_WALK_MARGIN;
+}
+
 
 /* Large enough for the mapping diagnostic, which is the entire point of the diagnostic build.
  * At 256 the region descriptions were cut off mid-address, which is worse than useless. */
@@ -263,18 +278,44 @@ static char g_prepare_reason[1024];
  * RANGE assembled from many VM regions, so the usable size is something to MEASURE, not to presume
  * from one observation.
  */
+/* WHY THE WALK STOPPED. Six distinct facts, and conflating them is what produced the bug: the walk
+ * hit a fixed 4096-region ceiling and the caller read that as "the provider returned 64 MiB". A cap
+ * is something WE did; a gap is something the PROVIDER did. They must never look alike. */
+typedef enum {
+    DROIDVM_WALK_COMPLETE = 0,
+    DROIDVM_WALK_GAP,               /* the next region does not start where this one ended */
+    DROIDVM_WALK_PROTECTION,        /* mapped, but not READ|EXECUTE */
+    DROIDVM_WALK_REGION_LIMIT,      /* our own cap, NOT a provider limit */
+    DROIDVM_WALK_TIME_LIMIT,        /* our own deadline, NOT a provider limit */
+    DROIDVM_WALK_OVERFLOW           /* the cursor would wrap the address space */
+} droidvm_walk_outcome;
+
+/* 16 KiB is the arm64 iOS page size, so a request of N bytes can legitimately be N/16384 regions:
+ * a gigabyte is 65536. A FIXED cap smaller than that stops the walk early and reports a short range
+ * that the provider never returned.
+ *
+ * Portable, because `droidvm_walk_region_bound` is portable and the host tests its arithmetic. */
+
 typedef struct {
     uintptr_t start;
     unsigned long long requested;
     unsigned long long first_region_size;
     unsigned long long contiguous;      /* proven usable from `start` */
     unsigned int regions_walked;
+    unsigned long long region_bound;    /* the cap actually applied */
     int range_complete;                 /* contiguous == requested */
     int first_gap_offset;               /* -1 when the range is complete */
     int gap_reason;                     /* 0 none, 1 unmapped, 2 not executable, 3 limit */
     int first_cur_prot, first_max_prot, last_cur_prot;
-    int walk_truncated;
+    int walk_truncated;                 /* nonzero when WE stopped it, not the map */
+    droidvm_walk_outcome outcome;
+    unsigned long long elapsed_ms;
 } droidvm_rx_range;
+
+/* PORTABLE ON PURPOSE: the bound depends only on the request, so the host can test the arithmetic
+ * this bug was about. 4096 must not come back for a 1 GiB request.
+ *
+ * Defined in the portable section above, beside the other host-visible symbols. */
 
 static uint64_t droidvm_now_ms(void)
 {
@@ -285,45 +326,69 @@ static uint64_t droidvm_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
-/* Walks forward from `start`, region by region, while each region is executable and begins exactly
- * where the previous one ended. BOUNDED TWICE: a fixed region cap and a wall-clock cap, so a
- * pathological map cannot spin this loop. Stops at the requested length. */
+/* Walks forward from `start`, region by region, while each region is READ|EXECUTE and begins exactly
+ * where the previous one ended. The walk IS the proof that there is no gap: coalescing cannot be
+ * assumed from endpoint samples, so every region on the way is asked about.
+ *
+ * BOUNDED TWICE, and the two bounds are independent: a region count DERIVED FROM THE REQUEST, and a
+ * wall-clock deadline. Reaching either one is recorded as truncation with its own reason, so a
+ * self-imposed stop is never reported as a property of the provider's mapping. */
 static void droidvm_walk_provider_range(uintptr_t start, unsigned long long requested,
                                         droidvm_rx_range *out)
 {
-    enum { kMaxRegions = 4096, kBudgetMs = 250 };
+    enum { kBudgetMs = 2000 };          /* independent of the region bound */
     char buf[DROIDVM_DIAG_REGION_LEN];
 
     memset(out, 0, sizeof(*out));
     out->start = start;
     out->requested = requested;
     out->first_gap_offset = -1;
+    out->region_bound = droidvm_walk_region_bound(requested);
 
-    const uint64_t deadline = droidvm_now_ms() + kBudgetMs;
+    const uint64_t started_at = droidvm_now_ms();
+    const uint64_t deadline = started_at + kBudgetMs;
     uintptr_t cursor = start;
     unsigned long long proven = 0;
 
-    while (out->regions_walked < kMaxRegions) {
-        if (proven >= requested) { out->range_complete = 1; break; }
+    for (;;) {
+        if (proven >= requested) {
+            out->range_complete = 1;
+            out->outcome = DROIDVM_WALK_COMPLETE;
+            break;
+        }
+        if ((unsigned long long)out->regions_walked >= out->region_bound) {
+            /* OUR CAP, NOT A PROVIDER LIMIT. Said plainly, because reading it as a short allocation
+             * is exactly the mistake this replaces. */
+            out->walk_truncated = 1;
+            out->outcome = DROIDVM_WALK_REGION_LIMIT;
+            out->gap_reason = 3;
+            out->first_gap_offset = (int)proven;
+            break;
+        }
         if (droidvm_now_ms() > deadline) {
-            out->walk_truncated = 1; out->gap_reason = 3;
+            out->walk_truncated = 1;
+            out->outcome = DROIDVM_WALK_TIME_LIMIT;
+            out->gap_reason = 3;
             out->first_gap_offset = (int)proven;
             break;
         }
 
         droidvm_region_info ri = region_probe("range", cursor, buf, sizeof(buf));
         if (!ri.mapped) {
+            out->outcome = DROIDVM_WALK_GAP;
             out->gap_reason = 1; out->first_gap_offset = (int)proven; break;
         }
         /* A region that does not START at the cursor means the walk has stepped over a gap: the
          * kernel answers with the NEXT region when an address is unmapped. */
         if (cursor != ri.base) {
+            out->outcome = DROIDVM_WALK_GAP;
             out->gap_reason = 1; out->first_gap_offset = (int)proven; break;
         }
         /* BOTH BITS. An execute-only mapping would pass an EXECUTE-only test and then be READ by
          * the readback -- before any fault guard is armed, because the guard belongs to the
          * self-test. Requiring READ here is what keeps the readback from being the crash. */
         if ((ri.cur_prot & VM_PROT_EXECUTE) == 0 || (ri.cur_prot & VM_PROT_READ) == 0) {
+            out->outcome = DROIDVM_WALK_PROTECTION;
             out->gap_reason = 2; out->first_gap_offset = (int)proven; break;
         }
 
@@ -337,10 +402,19 @@ static void droidvm_walk_provider_range(uintptr_t start, unsigned long long requ
 
         unsigned long long take = ri.size;
         if (take > requested - proven) { take = requested - proven; }
+        /* The cursor must not wrap, or the walk would loop over the address space. */
+        if (take > (unsigned long long)(UINTPTR_MAX - cursor)) {
+            out->walk_truncated = 1;
+            out->outcome = DROIDVM_WALK_OVERFLOW;
+            out->gap_reason = 3;
+            out->first_gap_offset = (int)proven;
+            break;
+        }
         proven += take;
         cursor += (uintptr_t)take;
     }
     out->contiguous = proven;
+    out->elapsed_ms = droidvm_now_ms() - started_at;
 }
 
 /* ---------------------------------------------------------------- the execution self-test
@@ -550,6 +624,16 @@ static droidvm_jit_status make_views(size_t bytes,
     g_bringup.range_complete = range.range_complete;
     g_bringup.first_gap_offset = range.first_gap_offset;
     g_bringup.gap_reason = range.gap_reason;
+    g_bringup.region_bound = range.region_bound;
+    g_bringup.elapsed_walk_ms = range.elapsed_ms;
+    g_bringup.walk_truncated = range.walk_truncated;
+    /* The reason is a NAME, so a report cannot read a self-imposed cap as a provider limit. */
+    switch (range.outcome) {
+    case DROIDVM_WALK_REGION_LIMIT: g_bringup.truncation_reason = 1; break;
+    case DROIDVM_WALK_TIME_LIMIT:   g_bringup.truncation_reason = 2; break;
+    case DROIDVM_WALK_OVERFLOW:     g_bringup.truncation_reason = 3; break;
+    default:                        g_bringup.truncation_reason = 0; break;
+    }
     g_bringup.rx_cur_prot = range.first_cur_prot;
     g_bringup.rx_max_prot = range.first_max_prot;
 
@@ -573,14 +657,25 @@ static droidvm_jit_status make_views(size_t bytes,
      * settle for less. */
     if (!range.range_complete) {
         bringup_mark(&g_bringup.provider_range, 0);
-        droidvm_jit_set_reason("provider_range: the provider's range covers only "
-                               "contiguous_rx_bytes=%llu of requested_bytes=%zu "
-                               "range_complete=0 (regions_walked=%u first_region_size=%llu "
-                               "gap_reason=%d first_gap_offset=%d walk_truncated=%d); "
+        /* THE REASON IS STATED IN WORDS, not left for the reader to infer from a number. A walk that
+         * we truncated is a fact about our limits; a gap is a fact about the provider's mapping. The
+         * previous report said neither, and the region cap was read as a 64 MiB allocation. */
+        const char *why =
+            (range.outcome == DROIDVM_WALK_REGION_LIMIT) ? "walk_truncated=1 truncation_reason=region_limit"
+          : (range.outcome == DROIDVM_WALK_TIME_LIMIT)   ? "walk_truncated=1 truncation_reason=time_limit"
+          : (range.outcome == DROIDVM_WALK_OVERFLOW)     ? "walk_truncated=1 truncation_reason=overflow"
+          : (range.outcome == DROIDVM_WALK_PROTECTION)   ? "walk_truncated=0 truncation_reason=none gap=protection"
+          : (range.outcome == DROIDVM_WALK_GAP)          ? "walk_truncated=0 truncation_reason=none gap=unmapped"
+                                                         : "walk_truncated=0 truncation_reason=none";
+
+        droidvm_jit_set_reason("provider_range: only contiguous_rx_bytes=%llu of requested_bytes=%zu "
+                               "was proven; %s "
+                               "(regions_walked=%u region_bound=%llu first_region_size=%llu "
+                               "gap_reason=%d first_gap_offset=%d elapsed_walk_ms=%llu); "
                                "a partial range cannot satisfy the request",
-                               range.contiguous, bytes,
-                               range.regions_walked, range.first_region_size,
-                               range.gap_reason, range.first_gap_offset, range.walk_truncated);
+                               range.contiguous, bytes, why,
+                               range.regions_walked, range.region_bound, range.first_region_size,
+                               range.gap_reason, range.first_gap_offset, range.elapsed_ms);
         droidvm_jit_break_detach();
         return DROIDVM_JIT_ALLOCATION_FAILED;
     }

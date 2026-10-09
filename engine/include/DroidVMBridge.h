@@ -118,6 +118,14 @@ droidvm_jit_status droidvm_jit_probe(void);
  * The prepare runs at most once per process. */
 droidvm_jit_status droidvm_jit_capture(size_t bytes, droidvm_jit_region *out);
 
+/* The walk's region cap for a request of `requested` bytes.
+ *
+ * PORTABLE, and deliberately so: the arithmetic is the thing that was wrong. A fixed cap of 4096 is
+ * smaller than a 1 GiB request needs at 16 KiB granularity (65536 regions), so the walk stopped at its
+ * own ceiling and the range was reported as provider-short. The host can call this and check the
+ * number, which is what the regression test does. */
+unsigned long long droidvm_walk_region_bound(unsigned long long requested);
+
 /* Where the bring-up pipeline got to, stage by stage.
  *
  * A single status cannot say which stage passed and which stopped: `FAILED` after a rejected range
@@ -139,8 +147,15 @@ typedef struct droidvm_bringup_report {
     unsigned long long contiguous_rx_bytes;   /* proven by the walk, before the request is judged */
     unsigned long long usable_bytes;
     unsigned long long first_region_size;
+    unsigned long long region_bound;          /* the cap the walk applied, derived from the request */
+    unsigned long long elapsed_walk_ms;
     unsigned int regions_walked;
     int range_complete;
+    /* NONZERO WHEN WE STOPPED THE WALK, not when the map did. A truncated walk must never be read as
+     * a property of the provider's mapping -- that is the bug this field exists to make impossible. */
+    int walk_truncated;
+    /* 0 none, 1 region_limit, 2 time_limit, 3 overflow. Rendered by name in the report. */
+    int truncation_reason;
     int first_gap_offset;
     int gap_reason;
     int rx_cur_prot;

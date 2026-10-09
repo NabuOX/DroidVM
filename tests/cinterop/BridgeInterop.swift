@@ -237,6 +237,32 @@ func testSerialSaturates() {
     check(droidvm_serial_bytes_written() == 0, "reset works")
 }
 
+// THE WALK'S REGION BOUND MUST SCALE WITH THE REQUEST.
+//
+// A device run reported contiguous_rx_bytes=67108864 with regions_walked=4096 and no gap of any kind.
+// 4096 * 16384 is exactly 67108864: the walker had hit a FIXED cap of 4096 regions and the caller read
+// that as a 64 MiB provider allocation. A gigabyte at 16 KiB granularity is 65536 regions, so the cap
+// has to be derived from the request.
+func testTheWalkBoundScalesWithTheRequest() {
+    let oneGiB: UInt64 = 1024 * 1024 * 1024
+
+    // The exact arithmetic from the device report.
+    check(UInt64(4096) * 16384 == 67108864,
+          "the observed 64 MiB is exactly 4096 regions of 16 KiB -- a self-imposed cap, not a size")
+
+    let bound = droidvm_walk_region_bound(oneGiB)
+    check(bound > 65536,
+          "a 1 GiB request needs at least 65536 regions at 16 KiB granularity; bound is \(bound)")
+    check(bound != 4096,
+          "the fixed cap that produced the false 64 MiB reading must not come back")
+
+    // And it must genuinely scale, rather than being a larger constant.
+    check(droidvm_walk_region_bound(oneGiB) > droidvm_walk_region_bound(oneGiB / 2),
+          "the bound scales with the request")
+    check(droidvm_walk_region_bound(65536) >= 4,
+          "a small request still gets a usable bound")
+}
+
 // MARK: - 6. C enum interop and the JIT status machine
 
 func testCEnumAndJITStatus() {
@@ -434,6 +460,7 @@ struct BridgeInterop {
         testAttachmentAndRegistration()
         testSerialSaturates()
         testCEnumAndJITStatus()
+        testTheWalkBoundScalesWithTheRequest()
         await testRealAdapterOverRealNativeCode()
         testStringsAndArgumentVector()
 

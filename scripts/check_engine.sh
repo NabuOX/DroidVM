@@ -513,6 +513,58 @@ else
         jit_failed=1
     fi
 
+    # ------------------------------------------------------------ the walk's termination semantics
+    #
+    # The device reported contiguous_rx_bytes=67108864 with regions_walked=4096 and NO gap of any
+    # kind. 4096 * 16384 is exactly that number: the walk had hit a FIXED cap and the caller read it as
+    # a 64 MiB provider allocation. Six outcomes now, and a cap of our own is never one of the
+    # provider's facts.
+    walk_outcomes=$(grep -cE 'DROIDVM_WALK_(COMPLETE|GAP|PROTECTION|REGION_LIMIT|TIME_LIMIT|OVERFLOW)' "$JIT_C" || true)
+    if grep -q 'outcome = DROIDVM_WALK_REGION_LIMIT;' "$JIT_C" \
+       && grep -q 'outcome = DROIDVM_WALK_TIME_LIMIT;' "$JIT_C" \
+       && grep -q 'outcome = DROIDVM_WALK_OVERFLOW;' "$JIT_C" \
+       && grep -q 'outcome = DROIDVM_WALK_GAP;' "$JIT_C" \
+       && grep -q 'outcome = DROIDVM_WALK_PROTECTION;' "$JIT_C" \
+       && [ "${walk_outcomes:-0}" -ge 6 ]; then
+        echo "  ok:   the walk distinguishes complete, gap, protection, region-limit, time-limit and overflow"
+    else
+        echo "      FAIL: the walk conflates its own limits with the provider's mapping (outcomes=$walk_outcomes)"
+        jit_failed=1
+    fi
+
+    # THE BOUND MUST BE DERIVED FROM THE REQUEST, and a self-imposed stop must SAY SO. Both halves are
+    # the bug: a fixed 4096 that a gigabyte cannot fit inside, and a truncation flag left at zero while
+    # the walk was truncated.
+    if grep -q 'out->region_bound = droidvm_walk_region_bound(requested);' "$JIT_C" \
+       && ! grep -qE 'kMaxRegions[[:space:]]*=[[:space:]]*4096' "$JIT_C" \
+       && grep -q 'unsigned long long droidvm_walk_region_bound(unsigned long long requested)' "$JIT_C" \
+       && grep -q 'DROIDVM_MIN_PAGE_SIZE  16384ull' "$JIT_C"; then
+        echo "  ok:   the walk's region bound is derived from the request, not a fixed 4096"
+    else
+        echo "      FAIL: the walk uses a fixed region cap, so a 1 GiB request cannot be validated"
+        jit_failed=1
+    fi
+
+    region_limit_block=$(awk '/outcome = DROIDVM_WALK_REGION_LIMIT;/{print NR}' "$JIT_C" | head -1)
+    truncated_before=$(awk -v n="$region_limit_block" 'NR < n && /out->walk_truncated = 1;/ {c++} END {print c + 0}' "$JIT_C")
+    if [ -n "$region_limit_block" ] && [ "${truncated_before:-0}" -ge 1 ]; then
+        echo "  ok:   reaching the region cap sets walk_truncated before recording the outcome"
+    else
+        echo "      FAIL: the region cap can be reached with walk_truncated still zero"
+        jit_failed=1
+    fi
+
+    # And the report carries both, so the impossible combination cannot be rendered.
+    if grep -q 'g_bringup.walk_truncated = range.walk_truncated;' "$JIT_C" \
+       && grep -q 'g_bringup.region_bound = range.region_bound;' "$JIT_C" \
+       && grep -q 'g_bringup.elapsed_walk_ms = range.elapsed_ms;' "$JIT_C" \
+       && grep -q 'g_bringup.truncation_reason = 1;' "$JIT_C"; then
+        echo "  ok:   walk_truncated, region_bound, truncation_reason and elapsed_walk_ms reach the report"
+    else
+        echo "      FAIL: the truncation fields do not reach the report"
+        jit_failed=1
+    fi
+
     [ "$jit_failed" -eq 0 ] || fails=$((fails + 1))
 fi
 
